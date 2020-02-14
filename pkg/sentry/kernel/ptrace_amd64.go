@@ -18,6 +18,7 @@ package kernel
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -30,7 +31,7 @@ func (t *Task) ptraceArch(target *Task, req int64, addr, data usermem.Addr) erro
 		if err != nil {
 			return err
 		}
-		_, err = t.CopyOut(data, n)
+		_, err = primitive.CopyUint64Out(t, data, *(n.(*uint64)))
 		return err
 
 	case linux.PTRACE_POKEUSR: // aka PTRACE_POKEUSER

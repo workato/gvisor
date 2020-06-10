@@ -74,6 +74,17 @@ load("@bazel_gazelle//:deps.bzl", "gazelle_dependencies", "go_repository")
 
 gazelle_dependencies()
 
+# Load foreign C/C++ build system support.
+http_archive(
+   name = "rules_foreign_cc",
+   strip_prefix = "rules_foreign_cc-master",
+   url = "https://github.com/bazelbuild/rules_foreign_cc/archive/master.zip",
+)
+
+load("@rules_foreign_cc//:workspace_definitions.bzl", "rules_foreign_cc_dependencies")
+
+rules_foreign_cc_dependencies()
+
 # The com_google_protobuf repository below would trigger downloading a older
 # version of org_golang_x_sys. If putting this repository statment in a place
 # after that of the com_google_protobuf, this statement will not work as
@@ -189,6 +200,7 @@ http_archive(
     ],
 )
 
+# Google benchmark framework.
 http_archive(
     name = "com_google_benchmark",
     sha256 = "3c6a165b6ecc948967a1ead710d4a181d7b0fbcaa183ef7ea84604994966221a",
@@ -282,6 +294,38 @@ go_repository(
     importpath = "github.com/mohae/deepcopy",
     sum = "h1:Sha2bQdoWE5YQPTlJOL31rmce94/tYi113SlFo1xQ2c=",
     version = "v0.0.0-20170308212314-bb9b5e7adda9",
+)
+
+http_archive(
+    name = "com_github_seccomp_libseccomp",
+    sha256 = "7fc28f4294cc72e61c529bedf97e705c3acf9c479a8f1a3028d4cd2ca9f3b155",
+    strip_prefix = "libseccomp-2.3.3",
+    urls = ["https://github.com/seccomp/libseccomp/releases/download/v2.3.3/libseccomp-2.3.3.tar.gz"],
+    build_file_content = """filegroup(name = "all", srcs = glob(["**"]), visibility = ["//visibility:public"])""",
+)
+
+http_archive(
+    name = "com_github_seccomp_libseccomp-golang",
+    sha256 = "a8fad60c29833945268831d86cde0bc535742c70ebf406f2f3d42a7541609748",
+    strip_prefix = "libseccomp-golang-f6ec81daf48e41bf48b475afc7fe06a26bfb72d1",
+    urls = [
+        "https://github.com/seccomp/libseccomp-golang/archive/f6ec81daf48e41bf48b475afc7fe06a26bfb72d1.tar.gz"
+    ],
+    build_file_content = """
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "libseccomp-golang",
+    srcs = [
+        "seccomp.go",
+        "seccomp_internal.go",
+    ],
+    cgo = True,
+    importpath = "github.com/seccomp/libseccomp-golang",
+    cdeps = ["@//tools/libseccomp:libseccomp"],
+    visibility = ["//visibility:public"],
+)
+    """
 )
 
 go_repository(

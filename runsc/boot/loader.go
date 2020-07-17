@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/rand"
@@ -86,11 +87,11 @@ type containerInfo struct {
 	// procArgs refers to the container's init task.
 	procArgs kernel.CreateProcessArgs
 
-	// stdioFDs contains stdin, stdout, and stderr.
-	stdioFDs []int
+	// stdios contains stdin, stdout, and stderr.
+	stdios []*fd.FD
 
 	// goferFDs are the FDs that attach the sandbox to the gofers.
-	goferFDs []int
+	goferFDs []*fd.FD
 }
 
 // Loader keeps state needed to start the kernel and run the container..
@@ -150,6 +151,11 @@ type execProcess struct {
 
 	// pidnsPath is the pid namespace path in spec
 	pidnsPath string
+
+	// hostTTY is present when creating a sub-container with terminal enabled.
+	// TTY file is passed during container create and must be saved until
+	// container start.
+	hostTTY *fd.FD
 }
 
 func init() {
@@ -186,7 +192,7 @@ type Args struct {
 	UserLogFD int
 }
 
-// make sure stdioFDs are always the same on initial start and on restore
+// make sure startingStdioFD is always the same on initial start and on restore.
 const startingStdioFD = 64
 
 // New initializes a new kernel loader configured by spec.
@@ -354,22 +360,27 @@ func New(args Args) (*Loader, error) {
 		k.SetHostMount(hostMount)
 	}
 
+	info := containerInfo{
+		conf:     args.Conf,
+		spec:     args.Spec,
+		procArgs: procArgs,
+	}
+
 	// Make host FDs stable between invocations. Host FDs must map to the exact
 	// same number when the sandbox is restored. Otherwise the wrong FD will be
 	// used.
-	var stdioFDs []int
 	newfd := startingStdioFD
-	for _, fd := range args.StdioFDs {
-		err := syscall.Dup3(fd, newfd, syscall.O_CLOEXEC)
+	for _, stdioFD := range args.StdioFDs {
+		err := syscall.Dup3(stdioFD, newfd, syscall.O_CLOEXEC)
 		if err != nil {
-			return nil, fmt.Errorf("dup3 of stdioFDs failed: %v", err)
+			return nil, fmt.Errorf("dup3 of stdios failed: %v", err)
 		}
-		stdioFDs = append(stdioFDs, newfd)
-		err = syscall.Close(fd)
-		if err != nil {
-			return nil, fmt.Errorf("close original stdioFDs failed: %v", err)
-		}
+		info.stdios = append(info.stdios, fd.New(newfd))
+		_ = syscall.Close(stdioFD)
 		newfd++
+	}
+	for _, goferFD := range args.GoferFDs {
+		info.goferFDs = append(info.goferFDs, fd.New(goferFD))
 	}
 
 	eid := execID{cid: args.ID}
@@ -379,13 +390,7 @@ func New(args Args) (*Loader, error) {
 		sandboxID:  args.ID,
 		processes:  map[execID]*execProcess{eid: {}},
 		mountHints: mountHints,
-		root: containerInfo{
-			conf:     args.Conf,
-			stdioFDs: stdioFDs,
-			goferFDs: args.GoferFDs,
-			spec:     args.Spec,
-			procArgs: procArgs,
-		},
+		root:       info,
 	}
 
 	// We don't care about child signals; some platforms can generate a
@@ -554,7 +559,9 @@ func (l *Loader) run() error {
 
 		// Create the root container init task. It will begin running
 		// when the kernel is started.
-		if _, err := l.createContainerProcess(true, l.sandboxID, &l.root, ep); err != nil {
+		var err error
+		_, ep.tty, ep.ttyVFS2, err = l.createContainerProcess(true, l.sandboxID, &l.root)
+		if err != nil {
 			return err
 		}
 	}
@@ -586,16 +593,13 @@ func (l *Loader) run() error {
 		}
 	})
 
-	// l.stdioFDs are derived from dup() in boot.New() and they are now dup()ed again
-	// either in createFDTable() during initial start or in descriptor.initAfterLoad()
-	// during restore, we can release l.stdioFDs now. VFS2 takes ownership of the
-	// passed FDs, so only close for VFS1.
+	// l.stdios are derived from dup() in boot.New() and they are now dup()ed
+	// again either in createFDTable() during initial start or in
+	// descriptor.initAfterLoad() during restore, we can release l.stdios now.
+	// VFS2 takes ownership of the passed FDs, so only close for VFS1.
 	if !kernel.VFS2Enabled {
-		for _, fd := range l.root.stdioFDs {
-			err := syscall.Close(fd)
-			if err != nil {
-				return fmt.Errorf("close dup()ed stdioFDs: %v", err)
-			}
+		for _, fd := range l.root.stdios {
+			_ = fd.Close()
 		}
 	}
 
@@ -605,7 +609,7 @@ func (l *Loader) run() error {
 }
 
 // createContainer creates a new container inside the sandbox.
-func (l *Loader) createContainer(cid string) error {
+func (l *Loader) createContainer(cid string, tty *fd.FD) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -613,14 +617,14 @@ func (l *Loader) createContainer(cid string) error {
 	if _, ok := l.processes[eid]; ok {
 		return fmt.Errorf("container %q already exists", cid)
 	}
-	l.processes[eid] = &execProcess{}
+	l.processes[eid] = &execProcess{hostTTY: tty}
 	return nil
 }
 
 // startContainer starts a child container. It returns the thread group ID of
 // the newly created process. Caller owns 'files' and may close them after
 // this method returns.
-func (l *Loader) startContainer(spec *specs.Spec, conf *Config, cid string, files []*os.File) error {
+func (l *Loader) startContainer(spec *specs.Spec, conf *Config, cid string, stdios, goferFDs []*fd.FD) error {
 	// Create capabilities.
 	caps, err := specutils.Capabilities(conf.EnableRaw, spec.Process.Capabilities)
 	if err != nil {
@@ -671,51 +675,52 @@ func (l *Loader) startContainer(spec *specs.Spec, conf *Config, cid string, file
 	}
 
 	info := &containerInfo{
-		conf: conf,
-		spec: spec,
+		conf:     conf,
+		spec:     spec,
+		goferFDs: goferFDs,
 	}
 	info.procArgs, err = createProcessArgs(cid, spec, creds, l.k, pidns)
 	if err != nil {
 		return fmt.Errorf("creating new process: %v", err)
 	}
 
-	// setupContainerFS() dups stdioFDs, so we don't need to dup them here.
-	for _, f := range files[:3] {
-		info.stdioFDs = append(info.stdioFDs, int(f.Fd()))
-	}
-
-	// Can't take ownership away from os.File. dup them to get a new FDs.
-	for _, f := range files[3:] {
-		fd, err := syscall.Dup(int(f.Fd()))
-		if err != nil {
-			return fmt.Errorf("failed to dup file: %v", err)
+	// Use stdios or TTY depending on the spec configuration.
+	if spec.Process.Terminal {
+		if len(stdios) > 0 {
+			return fmt.Errorf("using TTY, stdios not expected: %v", stdios)
 		}
-		info.goferFDs = append(info.goferFDs, fd)
+		if ep.hostTTY == nil {
+			return fmt.Errorf("terminal enabled but no TTY provided. Did you set --console-socket on create?")
+		}
+		info.stdios = []*fd.FD{ep.hostTTY, ep.hostTTY, ep.hostTTY}
+		ep.hostTTY = nil
+	} else {
+		info.stdios = stdios
+
+		// createFDTable() dups stdios in VFS1, close the local FDs when done.
+		if !kernel.VFS2Enabled {
+			defer func() {
+				for _, fd := range info.stdios {
+					_ = fd.Close()
+				}
+			}()
+		}
 	}
 
-	tg, err := l.createContainerProcess(false, cid, info, ep)
+	ep.tg, ep.tty, ep.ttyVFS2, err = l.createContainerProcess(false, cid, info)
 	if err != nil {
 		return err
 	}
-
-	// Success!
-	l.k.StartProcess(tg)
-	ep.tg = tg
+	l.k.StartProcess(ep.tg)
 	return nil
 }
 
-func (l *Loader) createContainerProcess(root bool, cid string, info *containerInfo, ep *execProcess) (*kernel.ThreadGroup, error) {
-	console := false
-	if root {
-		// Only root container supports terminal for now.
-		console = info.spec.Process.Terminal
-	}
-
+func (l *Loader) createContainerProcess(root bool, cid string, info *containerInfo) (*kernel.ThreadGroup, *host.TTYFileOperations, *hostvfs2.TTYFileDescription, error) {
 	// Create the FD map, which will set stdin, stdout, and stderr.
 	ctx := info.procArgs.NewContext(l.k)
-	fdTable, ttyFile, ttyFileVFS2, err := createFDTable(ctx, console, info.stdioFDs)
+	fdTable, ttyFile, ttyFileVFS2, err := createFDTable(ctx, info.spec.Process.Terminal, info.stdios)
 	if err != nil {
-		return nil, fmt.Errorf("importing fds: %v", err)
+		return nil, nil, nil, fmt.Errorf("importing fds: %v", err)
 	}
 	// CreateProcess takes a reference on fdTable if successful. We won't need
 	// ours either way.
@@ -727,11 +732,11 @@ func (l *Loader) createContainerProcess(root bool, cid string, info *containerIn
 	mntr := newContainerMounter(info.spec, info.goferFDs, l.k, l.mountHints)
 	if root {
 		if err := mntr.processHints(info.conf, info.procArgs.Credentials); err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 	}
 	if err := setupContainerFS(ctx, info.conf, mntr, &info.procArgs); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	// Add the HOME enviroment variable if it is not already set.
@@ -745,44 +750,40 @@ func (l *Loader) createContainerProcess(root bool, cid string, info *containerIn
 			info.procArgs.Credentials.RealKUID, info.procArgs.Envv)
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	info.procArgs.Envv = envv
 
 	// Create and start the new process.
 	tg, _, err := l.k.CreateProcess(info.procArgs)
 	if err != nil {
-		return nil, fmt.Errorf("creating process: %v", err)
+		return nil, nil, nil, fmt.Errorf("creating process: %v", err)
 	}
 	// CreateProcess takes a reference on FDTable if successful.
 	info.procArgs.FDTable.DecRef()
 
 	// Set the foreground process group on the TTY to the global init process
 	// group, since that is what we are about to start running.
-	if root {
-		switch {
-		case ttyFileVFS2 != nil:
-			ep.ttyVFS2 = ttyFileVFS2
-			ttyFileVFS2.InitForegroundProcessGroup(tg.ProcessGroup())
-		case ttyFile != nil:
-			ep.tty = ttyFile
-			ttyFile.InitForegroundProcessGroup(tg.ProcessGroup())
-		}
+	switch {
+	case ttyFileVFS2 != nil:
+		ttyFileVFS2.InitForegroundProcessGroup(tg.ProcessGroup())
+	case ttyFile != nil:
+		ttyFile.InitForegroundProcessGroup(tg.ProcessGroup())
 	}
 
-	return tg, nil
+	return tg, ttyFile, ttyFileVFS2, nil
 }
 
 // startGoferMonitor runs a goroutine to monitor gofer's health. It polls on
 // the gofer FDs looking for disconnects, and destroys the container if a
 // disconnect occurs in any of the gofer FDs.
-func (l *Loader) startGoferMonitor(cid string, goferFDs []int) {
+func (l *Loader) startGoferMonitor(cid string, goferFDs []*fd.FD) {
 	go func() {
 		log.Debugf("Monitoring gofer health for container %q", cid)
 		var events []unix.PollFd
-		for _, fd := range goferFDs {
+		for _, goferFD := range goferFDs {
 			events = append(events, unix.PollFd{
-				Fd:     int32(fd),
+				Fd:     int32(goferFD.FD()),
 				Events: unix.POLLHUP | unix.POLLRDHUP,
 			})
 		}
@@ -1254,7 +1255,7 @@ func (l *Loader) ttyFromIDLocked(key execID) (*host.TTYFileOperations, *hostvfs2
 	return ep.tty, ep.ttyVFS2, nil
 }
 
-func createFDTable(ctx context.Context, console bool, stdioFDs []int) (*kernel.FDTable, *host.TTYFileOperations, *hostvfs2.TTYFileDescription, error) {
+func createFDTable(ctx context.Context, console bool, stdioFDs []*fd.FD) (*kernel.FDTable, *host.TTYFileOperations, *hostvfs2.TTYFileDescription, error) {
 	if len(stdioFDs) != 3 {
 		return nil, nil, nil, fmt.Errorf("stdioFDs should contain exactly 3 FDs (stdin, stdout, and stderr), but %d FDs received", len(stdioFDs))
 	}

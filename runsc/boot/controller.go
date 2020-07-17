@@ -22,6 +22,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/control/server"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
@@ -199,10 +200,31 @@ func (cm *containerManager) Processes(cid *string, out *[]*control.Process) erro
 	return control.Processes(cm.l.k, *cid, out)
 }
 
+// CreateArgs contains arguments to the Create method.
+type CreateArgs struct {
+	// CID is the ID of the container to start.
+	CID string
+
+	// FilePayload may contain a TTY file for the terminal, if enabled.
+	urpc.FilePayload
+}
+
 // Create creates a container within a sandbox.
-func (cm *containerManager) Create(cid *string, _ *struct{}) error {
-	log.Debugf("containerManager.Create: %q", *cid)
-	return cm.l.createContainer(*cid)
+func (cm *containerManager) Create(args *CreateArgs, _ *struct{}) error {
+	log.Debugf("containerManager.Create: %+v", args)
+
+	if len(args.Files) > 1 {
+		return fmt.Errorf("start arguments must have at most 1 files for TTY")
+	}
+	var tty *fd.FD
+	if len(args.Files) == 1 {
+		var err error
+		tty, err = fd.NewFromFile(args.Files[0])
+		if err != nil {
+			return fmt.Errorf("error dup'ing TTY file: %w", err)
+		}
+	}
+	return cm.l.createContainer(args.CID, tty)
 }
 
 // StartArgs contains arguments to the Start method.
@@ -217,9 +239,8 @@ type StartArgs struct {
 	CID string
 
 	// FilePayload contains, in order:
-	//   * stdin, stdout, and stderr.
-	//   * the file descriptor over which the sandbox will
-	//     request files from its root filesystem.
+	//   * stdin, stdout, and stderr (optional: if terminal is disabled).
+	//   * file descriptors to connect to gofer to serve the root filesystem.
 	urpc.FilePayload
 }
 
@@ -240,15 +261,35 @@ func (cm *containerManager) Start(args *StartArgs, _ *struct{}) error {
 	if args.CID == "" {
 		return errors.New("start argument missing container ID")
 	}
-	if len(args.FilePayload.Files) < 4 {
-		return fmt.Errorf("start arguments must contain stdin, stderr, and stdout followed by at least one file for the container root gofer")
+	if len(args.Files) < 1 {
+		return fmt.Errorf("start arguments must contain at least one file for the container root gofer")
 	}
 
 	// All validation passed, logs the spec for debugging.
 	specutils.LogSpec(args.Spec)
 
-	err := cm.l.startContainer(args.Spec, args.Conf, args.CID, args.FilePayload.Files)
+	goferFiles := args.Files
+	var stdios []*fd.FD
+	if !args.Spec.Process.Terminal {
+		// When not using a terminal, stdios come as the first 3 files in the
+		// payload.
+		if l := len(args.Files); l < 4 {
+			return fmt.Errorf("start arguments (len: %d) must contain stdios and files for the container root gofer", l)
+		}
+		var err error
+		stdios, err = fd.NewFromFiles(goferFiles[:3])
+		if err != nil {
+			return fmt.Errorf("Error dup'ing stdio files: %w", err)
+		}
+		goferFiles = goferFiles[3:]
+	}
+
+	goferFDs, err := fd.NewFromFiles(goferFiles)
 	if err != nil {
+		return fmt.Errorf("error dup'ing gofer files: %w", err)
+	}
+
+	if err := cm.l.startContainer(args.Spec, args.Conf, args.CID, stdios, goferFDs); err != nil {
 		log.Debugf("containerManager.Start failed %q: %+v: %v", args.CID, args, err)
 		return err
 	}
@@ -312,18 +353,18 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 	log.Debugf("containerManager.Restore")
 
 	var specFile, deviceFile *os.File
-	switch numFiles := len(o.FilePayload.Files); numFiles {
+	switch numFiles := len(o.Files); numFiles {
 	case 2:
 		// The device file is donated to the platform.
 		// Can't take ownership away from os.File. dup them to get a new FD.
-		fd, err := syscall.Dup(int(o.FilePayload.Files[1].Fd()))
+		fd, err := syscall.Dup(int(o.Files[1].Fd()))
 		if err != nil {
 			return fmt.Errorf("failed to dup file: %v", err)
 		}
 		deviceFile = os.NewFile(uintptr(fd), "platform device")
 		fallthrough
 	case 1:
-		specFile = o.FilePayload.Files[0]
+		specFile = o.Files[0]
 	case 0:
 		return fmt.Errorf("at least one file must be passed to Restore")
 	default:

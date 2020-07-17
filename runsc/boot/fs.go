@@ -22,18 +22,10 @@ import (
 	"strings"
 	"syscall"
 
-	// Include filesystem types that OCI spec might mount.
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/dev"
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/host"
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/proc"
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/sys"
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/tmpfs"
-	_ "gvisor.dev/gvisor/pkg/sentry/fs/tty"
-	"gvisor.dev/gvisor/pkg/sentry/vfs"
-
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/gofer"
@@ -47,8 +39,17 @@ import (
 	tmpfsvfs2 "gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/runsc/specutils"
+
+	// Include filesystem types that OCI spec might mount.
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/dev"
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/host"
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/proc"
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/sys"
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/tmpfs"
+	_ "gvisor.dev/gvisor/pkg/sentry/fs/tty"
 )
 
 const (
@@ -319,14 +320,14 @@ func adjustDirentCache(k *kernel.Kernel) error {
 }
 
 type fdDispenser struct {
-	fds []int
+	fds []*fd.FD
 }
 
 func (f *fdDispenser) remove() int {
 	if f.empty() {
 		panic("fdDispenser out of fds")
 	}
-	rv := f.fds[0]
+	rv := f.fds[0].Release()
 	f.fds = f.fds[1:]
 	return rv
 }
@@ -563,7 +564,7 @@ type containerMounter struct {
 	hints *podMountHints
 }
 
-func newContainerMounter(spec *specs.Spec, goferFDs []int, k *kernel.Kernel, hints *podMountHints) *containerMounter {
+func newContainerMounter(spec *specs.Spec, goferFDs []*fd.FD, k *kernel.Kernel, hints *podMountHints) *containerMounter {
 	return &containerMounter{
 		root:   spec.Root,
 		mounts: compileMounts(spec),

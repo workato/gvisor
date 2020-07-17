@@ -23,6 +23,7 @@ go_library(
         "//pkg/sync",
         "//runsc/boot",
         "//runsc/cgroup",
+        "//runsc/console",
         "//runsc/sandbox",
         "//runsc/specutils",
         "@com_github_cenkalti_backoff//:go_default_library",

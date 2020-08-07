@@ -81,6 +81,7 @@ type IPv4 []byte
 
 const (
 	// IPv4MinimumSize is the minimum size of a valid IPv4 packet.
+	// i.e. a packet with no options.
 	IPv4MinimumSize = 20
 
 	// IPv4MaximumHeaderSize is the maximum size of an IPv4 header. Given
@@ -225,6 +226,11 @@ func (b IPv4) SetTOS(v uint8, _ uint32) {
 	b[tos] = v
 }
 
+// SetTTL sets the "Time to Live" field of the ipv4 header.
+func (b IPv4) SetTTL(v byte) {
+	(b)[ttl] = v
+}
+
 // SetTotalLength sets the "total length" field of the ipv4 header.
 func (b IPv4) SetTotalLength(totalLength uint16) {
 	binary.BigEndian.PutUint16(b[IPv4TotalLenOffset:], totalLength)
@@ -317,7 +323,7 @@ func IsV4MulticastAddress(addr tcpip.Address) bool {
 }
 
 // IsV4LoopbackAddress determines if the provided address is an IPv4 loopback
-// address (belongs to 127.0.0.1/8 subnet).
+// address (belongs to 127.0.0.0/8 subnet). See RFC 1122 section 3.2.1.3
 func IsV4LoopbackAddress(addr tcpip.Address) bool {
 	if len(addr) != IPv4AddressSize {
 		return false

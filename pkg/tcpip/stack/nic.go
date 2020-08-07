@@ -1262,9 +1262,9 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		local = n.linkEP.LinkAddress()
 	}
 
-	// Are any packet sockets listening for this network protocol?
+	// Are any packet type sockets listening for this network protocol?
 	packetEPs := n.mu.packetEPs[protocol]
-	// Add any other packet sockets that maybe listening for all protocols.
+	// Add any other packet type sockets that may be listening for all protocols.
 	packetEPs = append(packetEPs, n.mu.packetEPs[header.EthernetProtocolAll]...)
 	n.mu.RUnlock()
 	for _, ep := range packetEPs {
@@ -1285,6 +1285,7 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		return
 	}
 	if hasTransportHdr {
+		pkt.TransportProtocolNumber = transProtoNum
 		// Parse the transport header if present.
 		if state, ok := n.stack.transportProtocols[transProtoNum]; ok {
 			state.proto.Parse(pkt)
@@ -1420,6 +1421,21 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	state, ok := n.stack.transportProtocols[protocol]
 	if !ok {
 		n.stack.stats.UnknownProtocolRcvdPackets.Increment()
+		// As per RFC: 1122 Section 3.2.2.1 A host SHOULD generate Destination
+		//   Unreachable messages with code:
+		//     2 (Protocol Unreachable), when the designated transport protocol
+		//     is not supported
+		np, ok := n.stack.networkProtocols[r.NetProto]
+		if !ok {
+			panic(fmt.Sprintf("expected stack to have a NetworkProtocol for proto = %d", r.NetProto))
+		}
+
+		// Unlike in IPv6, the location of the protocol field in an IPv4 header is
+		// fixed (9) so we don't use that field in the case of an IPv4 error and
+		// it's not exported from the header pkg. We only put it here for
+		// consistency with the IPv6 code.
+		const protocolOffset = 9
+		_ = np.ReturnError(r, tcpip.ICMPReasonProtoUnreachable{Pointer: protocolOffset /* unused */}, pkt)
 		return
 	}
 
@@ -1473,9 +1489,24 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	}
 
 	// We could not find an appropriate destination for this packet, so
-	// deliver it to the global handler.
-	if !transProto.HandleUnknownDestinationPacket(r, id, pkt) {
+	// deliver it to the protocol specific error handler to see if it wants to
+	// handle it.
+	wellFormed, handled := transProto.HandleUnknownDestinationPacket(r, id, pkt)
+	if !wellFormed {
 		n.stack.stats.MalformedRcvdPackets.Increment()
+		return
+	}
+	if !handled {
+		// As per RFC: 1122 Section 3.2.2.1 A host SHOULD generate Destination
+		//   Unreachable messages with code:
+		//     3 (Port Unreachable), when the designated transport protocol
+		//     (e.g., UDP) is unable to demultiplex the datagram but has no
+		//     protocol mechanism to inform the sender.
+		np, ok := n.stack.networkProtocols[r.NetProto]
+		if !ok {
+			panic(fmt.Sprintf("expected stack to have a NetworkProtocol for proto = %d", r.NetProto))
+		}
+		_ = np.ReturnError(r, tcpip.ICMPReasonPortUnreachable{}, pkt)
 	}
 }
 

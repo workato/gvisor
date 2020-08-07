@@ -93,7 +93,7 @@ func (e *endpoint) NICID() tcpip.NICID {
 // MaxHeaderLength returns the maximum length needed by ipv4 headers (and
 // underlying protocols).
 func (e *endpoint) MaxHeaderLength() uint16 {
-	return e.linkEP.MaxHeaderLength() + header.IPv4MinimumSize
+	return e.linkEP.MaxHeaderLength() + header.IPv4MaximumHeaderSize
 }
 
 // GSOMaxSize returns the maximum GSO packet size.
@@ -226,8 +226,13 @@ func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params s
 }
 
 // WritePacket writes a packet to the given destination address and protocol.
+//
+// If there is a separate network header supplied, it is used, otherwise a
+// a new one is made using supplied parameters.
 func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) *tcpip.Error {
-	e.addIPHeader(r, pkt, params)
+	if pkt.NetworkHeader().View().IsEmpty() {
+		e.addIPHeader(r, pkt, params)
+	}
 
 	// iptables filtering. All packets that reach here are locally
 	// generated.
@@ -442,6 +447,9 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 	}
 	p := h.TransportProtocol()
 	if p == header.ICMPv4ProtocolNumber {
+		// TODO(#3810) when we sort out ICMP and transport headers, the setting
+		// of the transport number this will need to be removed.
+		pkt.TransportProtocolNumber = p
 		e.handleICMP(r, pkt)
 		return
 	}

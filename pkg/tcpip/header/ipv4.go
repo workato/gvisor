@@ -33,6 +33,7 @@ const (
 	checksum           = 10
 	srcAddr            = 12
 	dstAddr            = 16
+	options            = 20
 )
 
 // IPv4Fields contains the fields of an IPv4 packet. It is used to describe the
@@ -81,6 +82,7 @@ type IPv4 []byte
 
 const (
 	// IPv4MinimumSize is the minimum size of a valid IPv4 packet.
+	// i.e. a packet with no options.
 	IPv4MinimumSize = 20
 
 	// IPv4MaximumHeaderSize is the maximum size of an IPv4 header. Given
@@ -200,6 +202,11 @@ func (b IPv4) DestinationAddress() tcpip.Address {
 	return tcpip.Address(b[dstAddr : dstAddr+IPv4AddressSize])
 }
 
+// Options returns a byte array pointing to start of IP Options.
+func (b IPv4) Options() []byte {
+	return b[options:b.HeaderLength()]
+}
+
 // TransportProtocol implements Network.TransportProtocol.
 func (b IPv4) TransportProtocol() tcpip.TransportProtocolNumber {
 	return tcpip.TransportProtocolNumber(b.Protocol())
@@ -223,6 +230,11 @@ func (b IPv4) TOS() (uint8, uint32) {
 // SetTOS sets the "type of service" field of the ipv4 header.
 func (b IPv4) SetTOS(v uint8, _ uint32) {
 	b[tos] = v
+}
+
+// SetTTL sets the "Time to Live" field of the ipv4 header.
+func (b IPv4) SetTTL(newttl byte) {
+	(b)[ttl] = newttl
 }
 
 // SetTotalLength sets the "total length" field of the ipv4 header.
@@ -317,7 +329,7 @@ func IsV4MulticastAddress(addr tcpip.Address) bool {
 }
 
 // IsV4LoopbackAddress determines if the provided address is an IPv4 loopback
-// address (belongs to 127.0.0.1/8 subnet).
+// address (belongs to 127.0.0.0/8 subnet). See RFC 1122 section 3.2.1.3
 func IsV4LoopbackAddress(addr tcpip.Address) bool {
 	if len(addr) != IPv4AddressSize {
 		return false

@@ -93,7 +93,7 @@ func (e *endpoint) NICID() tcpip.NICID {
 // MaxHeaderLength returns the maximum length needed by ipv4 headers (and
 // underlying protocols).
 func (e *endpoint) MaxHeaderLength() uint16 {
-	return e.linkEP.MaxHeaderLength() + header.IPv4MinimumSize
+	return e.linkEP.MaxHeaderLength() + header.IPv4MaximumHeaderSize
 }
 
 // GSOMaxSize returns the maximum GSO packet size.
@@ -226,8 +226,11 @@ func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params s
 }
 
 // WritePacket writes a packet to the given destination address and protocol.
+// If there is a network header supplied use it, otherwise make a new one
 func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) *tcpip.Error {
-	e.addIPHeader(r, pkt, params)
+	if pkt.NetworkHeader().View().IsEmpty() {
+		e.addIPHeader(r, pkt, params)
+	}
 
 	// iptables filtering. All packets that reach here are locally
 	// generated.
@@ -439,9 +442,30 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 		if !ready {
 			return
 		}
+
+		h.SetTotalLength(uint16(pkt.Data.Size() + len((h))))
+		h.SetFlagsFragmentOffset(0, 0)
 	}
+
+	// Only look for options if there is room for them.
+	if len(h) > header.IPv4MinimumSize {
+		aux, err := ProcessIPOptions(r, h.Options())
+		if err != nil {
+			// As we are in the IPv4 package here we can skip the wrapper and go
+			// direct to SendICMPError(). A failure to launch is not a panic
+			// condition so ignore the return value for now.
+			SendICMPError(r, header.ICMPv4ParamProblem, 0, aux, pkt)
+			e.stack.Stats().MalformedRcvdPackets.Increment()
+			r.Stats().IP.MalformedPacketsReceived.Increment()
+			return
+		}
+	}
+
 	p := h.TransportProtocol()
 	if p == header.ICMPv4ProtocolNumber {
+		// TODO(#3810) when we sort out ICMP and transport headers, the setting
+		// of the transport number this will need to be removed.
+		pkt.TransportProtocolNumber = p
 		e.handleICMP(r, pkt)
 		return
 	}

@@ -1344,6 +1344,36 @@ type IPStats struct {
 	// MalformedFragmentsReceived is the total number of IP Fragments that were
 	// dropped due to the fragment failing validation checks.
 	MalformedFragmentsReceived *StatCounter
+
+	// OptionTSReceived is the number of Timestamp options seen.
+	OptionTSReceived *StatCounter
+
+	// OptionRRReceived is the number of Record Route options seen.
+	OptionRRReceived *StatCounter
+
+	// OptionSecurityReceived is the number of Security options seen.
+	OptionSecurityReceived *StatCounter
+
+	// OptionLSRReceived is the number of Loose Source Route options seen.
+	OptionLSRReceived *StatCounter
+
+	// OptionExtSecReceived is the number of Extended Security options seen.
+	OptionExtSecReceived *StatCounter
+
+	// OptionComSecReceived is the number of Commercial Security options seen.
+	OptionComSecReceived *StatCounter
+
+	// OptionStreamIDReceived is the number of Stream ID options seen.
+	OptionStreamIDReceived *StatCounter
+
+	// OptionSSRReceived is the number of Strict Source Route options seen.
+	OptionSSRReceived *StatCounter
+
+	// OptionRouterAlertReceived is the number of Router Alert options seen.
+	OptionRouterAlertReceived *StatCounter
+
+	// OptionRouterAlertReceived is the number of Unknown IP options seen.
+	OptionUnknownReceived *StatCounter
 }
 
 // TCPStats collects TCP-specific stats.
@@ -1845,3 +1875,30 @@ func DeleteDanglingEndpoint(e Endpoint) {
 // AsyncLoading is the global barrier for asynchronous endpoint loading
 // activities.
 var AsyncLoading sync.WaitGroup
+
+// ICMPReason is a marker interface for generic ICMP errors.
+// See the implementors of ICMPReason for details on the ICMP errors.
+type ICMPReason interface {
+	isICMP()
+}
+
+// In each of the following types, isICMP implements ICMPReason.isICMP.
+// Its only reason is to make these structs be implementations of the
+// ICMPReason interface and to ensure that all ICMPReason definitions must be
+// in this package.
+
+// ICMPReasonPortUnreachable is an error where the transport protocol has no
+// listener and no alternative means to inform the sender.
+type ICMPReasonPortUnreachable struct{}
+
+func (ICMPReasonPortUnreachable) isICMP() {}
+
+// ICMPReasonProtoUnreachable is an error where the packet has a protocol field
+// that we don't recognise.
+type ICMPReasonProtoUnreachable struct {
+	// Pointer gives the offset of the protocol field. In IPv4 this
+	// is ignored but in IPv6 it is used.
+	Pointer uint32
+}
+
+func (ICMPReasonProtoUnreachable) isICMP() {}

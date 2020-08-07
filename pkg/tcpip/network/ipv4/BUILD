@@ -7,6 +7,7 @@ go_library(
     srcs = [
         "icmp.go",
         "ipv4.go",
+        "options.go",
     ],
     visibility = ["//visibility:public"],
     deps = [

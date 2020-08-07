@@ -388,6 +388,11 @@ func (c *testContext) getPacketAndVerify(flow testFlow, checkers ...checker.Netw
 		c.t.Fatalf("Bad network protocol: got %v, wanted %v", p.Proto, flow.netProto())
 	}
 
+	if p.Pkt.TransportProtocolNumber != header.UDPProtocolNumber {
+		c.t.Errorf("p.Pkt.TransportProtocolNumber; got = %d, wanted = %d",
+			p.Pkt.TransportProtocolNumber, header.UDPProtocolNumber)
+	}
+
 	vv := buffer.NewVectorisedView(p.Pkt.Size(), p.Pkt.Views())
 	b := vv.ToView()
 
@@ -1797,16 +1802,28 @@ func TestV4UnknownDestination(t *testing.T) {
 				checker.ICMPv4Type(header.ICMPv4DstUnreachable),
 				checker.ICMPv4Code(header.ICMPv4PortUnreachable)))
 
+			// We need to compare the included data part of the udp packet that is in
+			// the ICMP packet with the matching original data.
 			icmpPkt := header.ICMPv4(hdr.Payload())
 			payloadIPHeader := header.IPv4(icmpPkt.Payload())
-			wantLen := len(payload)
+			incomingHeaderLength := header.IPv4MinimumSize + header.UDPMinimumSize
+			var wantLen int
 			if tc.largePayload {
-				wantLen = header.IPv4MinimumProcessableDatagramSize - header.IPv4MinimumSize*2 - header.ICMPv4MinimumSize - header.UDPMinimumSize
+				// To work out the data size we need to simulate what the sender would
+				// have done. The wanted size is the total available minus the sum of
+				// the headers in the udp AND icmp packets, given that we know the test
+				// had only a minimal IP header but the ICMP sender will have allowed
+				// for a maximally sized packet header.
+				wantLen = header.IPv4MinimumProcessableDatagramSize - header.IPv4MaximumHeaderSize - header.ICMPv4MinimumSize - incomingHeaderLength
+			} else {
+				// In the tests with smaller payloads we don't have to worry.
+				wantLen = len(payload)
 			}
 
-			// In case of large payloads the IP packet may be truncated. Update
+			// In the case of large payloads the IP packet may be truncated. Update
 			// the length field before retrieving the udp datagram payload.
-			payloadIPHeader.SetTotalLength(uint16(wantLen + header.UDPMinimumSize + header.IPv4MinimumSize))
+			// Add back the two headers within the payload
+			payloadIPHeader.SetTotalLength(uint16(wantLen + incomingHeaderLength))
 
 			origDgram := header.UDP(payloadIPHeader.Payload())
 			if got, want := len(origDgram.Payload()), wantLen; got != want {
@@ -1937,6 +1954,60 @@ func TestIncrementMalformedPacketsReceived(t *testing.T) {
 	}
 	if got := c.ep.Stats().(*tcpip.TransportEndpointStats).ReceiveErrors.MalformedPacketsReceived.Value(); got != want {
 		t.Errorf("got EP Stats.ReceiveErrors.MalformedPacketsReceived stats = %d, want = %d", got, want)
+	}
+}
+
+// TestStoredTransportProtocolNumber verifies that while the packet is being
+// processed the tranport protocol number is stored into the PacketBuffer.
+func TestStoredTransportProtocolNumber(t *testing.T) {
+	testCases := []struct {
+		name  string
+		proto tcpip.NetworkProtocolNumber
+		flow  testFlow
+	}{
+		{
+			name:  "IPv6",
+			proto: header.IPv6ProtocolNumber,
+			flow:  unicastV6,
+		},
+		{
+			name:  "IPv4",
+			proto: header.IPv4ProtocolNumber,
+			flow:  unicastV4,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+
+			c := newDualTestContext(t, defaultMTU)
+			defer c.cleanup()
+
+			c.createEndpoint(testCase.proto)
+			// Bind to wildcard.
+			if err := c.ep.Bind(tcpip.FullAddress{Port: stackPort}); err != nil {
+				c.t.Fatalf("Bind to port %d failed: %s", stackPort, err)
+			}
+
+			payload := newPayload()
+			h := testCase.flow.header4Tuple(incoming)
+			var buf buffer.View
+			switch testCase.proto {
+			case header.IPv6ProtocolNumber:
+				buf = c.buildV6Packet(payload, &h)
+			case header.IPv4ProtocolNumber:
+				buf = c.buildV4Packet(payload, &h)
+			default:
+				c.t.Fatalf("Unexpected Protocol %d", testCase.proto)
+			}
+
+			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Data: buf.ToVectorisedView()})
+			c.linkEP.InjectInbound(testCase.proto, pkt)
+			// While it was away in the stack getting processed the transport protocol
+			// number should have been stored into the packet buffer.
+			if pkt.TransportProtocolNumber != udp.ProtocolNumber {
+				c.t.Errorf("got pkt.TransportProtocolNumber = %d, want = %d", pkt.TransportProtocolNumber, udp.ProtocolNumber)
+			}
+		})
 	}
 }
 

@@ -15,6 +15,7 @@
 package ipv4
 
 import (
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -105,7 +106,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer) {
 		// source address MUST be one of its own IP addresses (but not a broadcast
 		// or multicast address).
 		localAddr := r.LocalAddress
-		if r.IsInboundBroadcast() || header.IsV4MulticastAddress(r.LocalAddress) {
+		if r.IsInboundBroadcast() || header.IsV4MulticastAddress(localAddr) {
 			localAddr = ""
 		}
 
@@ -131,7 +132,10 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer) {
 			ReserveHeaderBytes: int(r.MaxHeaderLength()),
 			Data:               dataVV,
 		})
-
+		// TODO(#3810) When adding protocol numbers into the header information
+		// we will have to change this code to handle the ICMP header no longer
+		// being in the data buffer.
+		replyPkt.TransportProtocolNumber = header.ICMPv4ProtocolNumber
 		// Send out the reply packet.
 		sent := stats.ICMP.V4PacketsSent
 		if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{
@@ -192,4 +196,173 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer) {
 	default:
 		received.Invalid.Increment()
 	}
+}
+
+// ReturnError implements stack.TransportProtocol.ReturnError.
+func (p *protocol) ReturnError(r *stack.Route, reason tcpip.ICMPReason, pkt *stack.PacketBuffer) *tcpip.Error {
+	switch reason.(type) {
+	case tcpip.ICMPReasonPortUnreachable:
+		return sendICMPError(r,
+			header.ICMPv4DstUnreachable,
+			header.ICMPv4PortUnreachable,
+			0, pkt)
+	case tcpip.ICMPReasonProtoUnreachable:
+		return sendICMPError(r,
+			header.ICMPv4DstUnreachable,
+			header.ICMPv4ProtoUnreachable,
+			0, pkt)
+	default:
+		return tcpip.ErrNotSupported
+	}
+}
+
+// Function SendICMPError sends an ICMPv4 error report back to the remote device
+// that sent the problematic packet. It will incorporate as much of that packet
+// as possible as well as any error metadata as is available. SendICMPError
+// expects pkt to hold a valid IPv4 packet as per the wire format. There is no
+// reason to not export this function if it is needed outside of the ipv4
+// package.
+func sendICMPError(r *stack.Route, eType header.ICMPv4Type, eCode header.ICMPv4Code, aux int, pkt *stack.PacketBuffer) *tcpip.Error {
+	// For now these are all we support here. Others are not error types.
+	// This implies a programming error.
+
+	switch eType {
+	case
+		header.ICMPv4DstUnreachable,
+		header.ICMPv4TimeExceeded,
+		header.ICMPv4ParamProblem:
+	default:
+		panic("Unsupported ICMP type")
+	}
+
+	stats := r.Stats()
+	sent := stats.ICMP.V4PacketsSent
+	if !r.Stack().AllowICMPMessage() {
+		sent.RateLimited.Increment()
+		return nil
+	}
+
+	// We check we are responding only when we are allowed to.
+	// See RFC1112 section 7.2, RFC1122 section 3.2.2 and RFC1812 section 4.3.2.7.
+	// RFC1812's section "4.3.2.7 When Not to Send ICMP Errors" is very specific.
+	//
+	// Only send an ICMP error if the original destination address is not a
+	// multicast/broadcast v4 address or the source is not the
+	// unspecified address.
+	if r.IsInboundBroadcast() || header.IsV4MulticastAddress(r.LocalAddress) || r.RemoteAddress == header.IPv4Any {
+		return nil
+	}
+
+	nh := pkt.NetworkHeader().View()
+	th := pkt.TransportHeader().View()
+	ih := header.IPv4(nh)
+
+	// The RFCs are very specific about not responding to icmp error packets.
+	if ih.Protocol() == uint8(header.ICMPv4ProtocolNumber) {
+		// Unfortunately the current stack pretty much always has ICMPv4 headers
+		// in the Data section of the packet but there is no guarantee that is the
+		// case. If this is the case grab the header to make it like all other
+		// packet types.
+		var ok bool
+		if th.IsEmpty() {
+			th, ok = pkt.TransportHeader().Consume(header.ICMPv4MinimumSize)
+			if !ok {
+				return nil
+			}
+		} else if th.Size() < header.ICMPv4MinimumSize {
+			return nil
+		}
+		switch header.ICMPv4(th).Type() {
+		case
+			header.ICMPv4EchoReply,
+			header.ICMPv4Redirect,
+			header.ICMPv4Echo,
+			header.ICMPv4Timestamp,
+			header.ICMPv4TimestampReply,
+			header.ICMPv4InfoRequest,
+			header.ICMPv4InfoReply:
+		default:
+			// Assume any type we don't know about may be an error type.
+			return nil
+		}
+	} else if th.IsEmpty() {
+		return nil
+	}
+
+	// Now work out how much of the triggering packet we should return.
+	// As per RFC 1812 Section 4.3.2.3
+	//
+	//   ICMP datagram SHOULD contain as much of the original
+	//   datagram as possible without the length of the ICMP
+	//   datagram exceeding 576 bytes.
+	//
+	// NOTE: The above RFC referenced is different from the original
+	// recommendation in RFCs 1122 and 792 where it mentioned that at least 8
+	// bytes of the payload must be included. Today linux and other systems
+	// implement the RFC1812 definition and not the original RFC 1122/792
+	// requirement. We treat 8 bytes as the minimum but will try send more.
+	mtu := int(r.MTU())
+	if mtu > header.IPv4MinimumProcessableDatagramSize {
+		mtu = header.IPv4MinimumProcessableDatagramSize
+	}
+	headerLen := int(r.MaxHeaderLength()) + header.ICMPv4MinimumSize
+	available := int(mtu) - headerLen
+
+	if available < header.IPv4MinimumSize+header.ICMPv4MinimumErrorPayloadSize {
+		return nil
+	}
+
+	payloadLen := nh.Size() + th.Size() + pkt.Data.Size()
+	if payloadLen > available {
+		payloadLen = available
+	}
+
+	// The buffers used by pkt may be used elsewhere in the system.
+	// For example, a AF_RAW or AF_PACKET socket may use what the transport
+	// protocol considers an unreachable destination. Thus we deep copy pkt to
+	// prevent multiple ownership and SR errors. The new copy is a vectorized
+	// view with the entire incoming IP packet reassembled and truncated as
+	// required.
+	newHeader := append(buffer.View(nil), nh...)
+	newHeader = append(newHeader, th...)
+	payload := newHeader.ToVectorisedView()
+	payload.AppendView(pkt.Data.ToView())
+	payload.CapLength(payloadLen)
+
+	icmpPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: headerLen,
+		Data:               payload,
+	})
+
+	icmpHdr := header.ICMPv4(icmpPkt.TransportHeader().Push(header.ICMPv4MinimumSize))
+	icmpPkt.TransportProtocolNumber = header.ICMPv4ProtocolNumber
+	icmpHdr.SetType(eType)
+	icmpHdr.SetCode(eCode)
+	icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, icmpPkt.Data))
+	// We know that ParamProblem messages need special help.
+	if eType == header.ICMPv4ParamProblem {
+		icmpHdr.SetPointer(byte(aux))
+	}
+
+	err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{
+		Protocol: header.ICMPv4ProtocolNumber,
+		TTL:      r.DefaultTTL(),
+		TOS:      stack.DefaultTOS}, icmpPkt)
+	if err != nil {
+		sent.Dropped.Increment()
+		return err
+	}
+	switch eType {
+	case header.ICMPv4DstUnreachable:
+		sent.DstUnreachable.Increment()
+	case header.ICMPv4SrcQuench:
+		sent.SrcQuench.Increment()
+	case header.ICMPv4Redirect:
+		sent.Redirect.Increment()
+	case header.ICMPv4TimeExceeded:
+		sent.TimeExceeded.Increment()
+	case header.ICMPv4ParamProblem:
+		sent.ParamProblem.Increment()
+	}
+	return nil
 }

@@ -260,6 +260,11 @@ func (c *Context) GetPacket() []byte {
 		c.t.Fatalf("Bad network protocol: got %v, wanted %v", p.Proto, ipv4.ProtocolNumber)
 	}
 
+	// Just check that the outgoing packet has a valid Transport Protocol number.
+	if p.Pkt.TransportProtocolNumber != tcp.ProtocolNumber {
+		c.t.Fatalf("got p.Pkt.TransportProtocolNumber = %d, want = %d", p.Pkt.TransportProtocolNumber, tcp.ProtocolNumber)
+	}
+
 	vv := buffer.NewVectorisedView(p.Pkt.Size(), p.Pkt.Views())
 	b := vv.ToView()
 
@@ -285,6 +290,11 @@ func (c *Context) GetPacketNonBlocking() []byte {
 
 	if p.Proto != ipv4.ProtocolNumber {
 		c.t.Fatalf("Bad network protocol: got %v, wanted %v", p.Proto, ipv4.ProtocolNumber)
+	}
+
+	// Just check that the outgoing packet has a valid Transport Protocol number.
+	if p.Pkt.TransportProtocolNumber != tcp.ProtocolNumber {
+		c.t.Fatalf("got p.Pkt.TransportProtocolNumber = %d, want = %d", p.Pkt.TransportProtocolNumber, tcp.ProtocolNumber)
 	}
 
 	vv := buffer.NewVectorisedView(p.Pkt.Size(), p.Pkt.Views())

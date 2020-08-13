@@ -924,7 +924,11 @@ func (e *endpoint) handleWrite() *tcpip.Error {
 
 	first := e.sndQueue.Front()
 	if first != nil {
+		lastSeg := e.snd.writeList.Back()
 		e.snd.writeList.PushBackList(&e.sndQueue)
+		for seg := lastSeg; seg != nil; seg = seg.segEntry.Next() {
+			e.snd.rcList.PushBack(seg)
+		}
 		e.sndBufInQueue = 0
 	}
 

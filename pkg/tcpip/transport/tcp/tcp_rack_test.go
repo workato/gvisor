@@ -72,3 +72,54 @@ func TestRACKUpdate(t *testing.T) {
 	c.SendAck(790, bytesRead)
 	time.Sleep(200 * time.Millisecond)
 }
+
+// TestRACKDetectReorder tests that RACK detects packet reordering.
+func TestRACKDetectReorder(t *testing.T) {
+	const maxPayload = 10
+	const tsOptionSize = 12
+	const maxTCPOptionSize = 40
+
+	c := context.New(t, uint32(header.TCPMinimumSize+header.IPv4MinimumSize+maxTCPOptionSize+maxPayload))
+	defer c.Cleanup()
+
+	ackNum := 1
+	c.Stack().AddTCPProbe(func(state stack.TCPEndpointState) {
+		// Validate that RACK detects packet reordering for the
+		// endpoint.
+		gotSeq := state.Sender.RACKState.FACK
+		wantSeq := state.Sender.SndNxt
+		if !gotSeq.LessThanEq(wantSeq) || gotSeq.LessThan(wantSeq) {
+			t.Fatalf("RACK FACK failed to update, got: %v, but want: %v", gotSeq, wantSeq)
+		}
+
+		if ackNum == 2 && state.Sender.RACKState.Reord == false {
+			t.Fatalf("RACK reorder detection failed")
+		}
+		ackNum++
+	})
+	setStackSACKPermitted(t, c, true)
+	createConnectedWithSACKAndTS(c)
+
+	data := buffer.NewView(2 * maxPayload)
+	for i := range data {
+		data[i] = byte(i)
+	}
+
+	// Write the data.
+	if _, _, err := c.EP.Write(tcpip.SlicePayload(data), tcpip.WriteOptions{}); err != nil {
+		t.Fatalf("Write failed: %s", err)
+	}
+
+	bytesRead := 0
+	for i := 0; i < 2; i++ {
+		c.ReceiveAndCheckPacketWithOptions(data, bytesRead, maxPayload, tsOptionSize)
+		bytesRead += maxPayload
+	}
+
+	start := c.IRS.Add(1)
+	end := start.Add(maxPayload)
+	c.SendAckWithSACK(790, 0, []header.SACKBlock{{start, end}})
+	c.SendAck(790, bytesRead)
+
+	time.Sleep(200 * time.Millisecond)
+}

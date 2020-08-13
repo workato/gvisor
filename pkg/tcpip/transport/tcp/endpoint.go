@@ -1427,7 +1427,7 @@ func (e *endpoint) Peek(vec [][]byte) (int64, tcpip.ControlMessages, *tcpip.Erro
 	vec = append([][]byte(nil), vec...)
 
 	var num int64
-	for s := e.rcvList.Front(); s != nil; s = s.Next() {
+	for s := e.rcvList.Front(); s != nil; s = s.segEntry.Next() {
 		views := s.data.Views()
 
 		for i := s.viewToDeliver; i < len(views); i++ {
@@ -2248,7 +2248,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) *tc
 	if !handshake {
 		e.segmentQueue.mu.Lock()
 		for _, l := range []segmentList{e.segmentQueue.list, e.sndQueue, e.snd.writeList} {
-			for s := l.Front(); s != nil; s = s.Next() {
+			for s := l.Front(); s != nil; s = s.segEntry.Next() {
 				s.id = e.ID
 				s.route = r.Clone()
 				e.sndWaker.Assert()
@@ -2897,6 +2897,7 @@ func (e *endpoint) completeState() stack.TCPEndpointState {
 		EndSequence: rc.endSequence,
 		FACK:        rc.fack,
 		RTT:         rc.rtt,
+		Reord:       rc.reord,
 	}
 	return s
 }

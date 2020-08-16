@@ -1838,7 +1838,7 @@ func (s *Stack) LeaveGroup(protocol tcpip.NetworkProtocolNumber, nicID tcpip.NIC
 	defer s.mu.RUnlock()
 
 	if nic, ok := s.nics[nicID]; ok {
-		return nic.leaveGroup(multicastAddr)
+		return nic.leaveGroup(protocol, multicastAddr)
 	}
 	return tcpip.ErrUnknownNICID
 }
@@ -2025,16 +2025,14 @@ func (s *Stack) FindNetworkEndpoint(netProto tcpip.NetworkProtocolNumber, addres
 	defer s.mu.RUnlock()
 
 	for _, nic := range s.nics {
-		id := NetworkEndpointID{address}
-
-		if ref, ok := nic.mu.endpoints[id]; ok {
-			nic.mu.RLock()
-			defer nic.mu.RUnlock()
-
-			// An endpoint with this id exists, check if it can be
-			// used and return it.
-			return ref.ep, nil
+		ref := nic.getRefOrCreateTemp(netProto, address, NeverPrimaryEndpoint, none)
+		if ref == nil {
+			continue
 		}
+
+		ep := ref.ep
+		ref.decRef()
+		return ep, nil
 	}
 	return nil, tcpip.ErrBadAddress
 }

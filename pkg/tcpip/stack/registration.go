@@ -229,6 +229,14 @@ type NetworkHeaderParams struct {
 // NetworkEndpoint is the interface that needs to be implemented by endpoints
 // of network layer protocols (e.g., ipv4, ipv6).
 type NetworkEndpoint interface {
+	AddressableEndpoint
+
+	// Enable enables the endpoint.
+	Enable() *tcpip.Error
+
+	// Disable disables the endpoint.
+	Disable() *tcpip.Error
+
 	// DefaultTTL is the default time-to-live value (or hop limit, in ipv6)
 	// for this endpoint.
 	DefaultTTL() uint8

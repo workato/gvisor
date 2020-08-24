@@ -60,6 +60,9 @@ type segment struct {
 	// xmitTime is the last transmit time of this segment.
 	xmitTime  time.Time `state:".(unixTime)"`
 	xmitCount uint32
+
+	// acked indicates if the segment has already been SACKed.
+	acked bool
 }
 
 // segmentMapper is the ElementMapper for the writeList.

@@ -25,15 +25,15 @@ import (
 // sequence counts. To use RACK, SACK should be enabled on the connection.
 
 // rackControl stores the rack related fields.
-// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-6.1
+// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-09#section-5.2
 //
 // +stateify savable
 type rackControl struct {
-	// xmitTime is the latest transmission timestamp of rackControl.seg.
-	xmitTime time.Time `state:".(unixTime)"`
-
 	// endSequence is the ending TCP sequence number of rackControl.seg.
 	endSequence seqnum.Value
+
+	// dsack indicates if the connection has seen a DSACK.
+	dsack bool
 
 	// fack is the highest selectively or cumulatively acknowledged
 	// sequence.
@@ -44,11 +44,17 @@ type rackControl struct {
 	// acknowledged) that was not marked invalid as a possible spurious
 	// retransmission.
 	rtt time.Duration
+
+	// reord indicates if reordering has been detected on this connection..
+	reord bool
+
+	// xmitTime is the latest transmission timestamp of rackControl.seg.
+	xmitTime time.Time `state:".(unixTime)"`
 }
 
-// Update will update the RACK related fields when an ACK has been received.
-// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.2
-func (rc *rackControl) Update(seg *segment, ackSeg *segment, srtt time.Duration, offset uint32) {
+// update will update the RACK related fields when an ACK has been received.
+// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-09#section-6.2
+func (rc *rackControl) update(seg *segment, ackSeg *segment, srtt time.Duration, offset uint32) {
 	rtt := time.Now().Sub(seg.xmitTime)
 
 	// If the ACK is for a retransmitted packet, do not update if it is a
@@ -57,7 +63,7 @@ func (rc *rackControl) Update(seg *segment, ackSeg *segment, srtt time.Duration,
 	// transmit time of the most recent retransmitted packet.
 	// 2. When RTT calculated for the packet is less than the smoothed RTT
 	// for the connection.
-	// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.2
+	// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-09#section-6.2
 	// step 2
 	if seg.xmitCount > 1 {
 		if ackSeg.parsedOptions.TS && ackSeg.parsedOptions.TSEcr != 0 {
@@ -79,4 +85,24 @@ func (rc *rackControl) Update(seg *segment, ackSeg *segment, srtt time.Duration,
 		rc.xmitTime = seg.xmitTime
 		rc.endSequence = endSeq
 	}
+}
+
+// detectReorder detects if packet reordering has been observed.
+// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-09#section-6.2
+// step 3
+func (rc *rackControl) detectReorder(seg *segment) {
+	endSeq := seg.sequenceNumber.Add(seqnum.Size(seg.data.Size()))
+	if rc.fack.LessThan(endSeq) {
+		rc.fack = endSeq
+		return
+	}
+
+	if endSeq.LessThan(rc.fack) && seg.xmitCount == 1 {
+		rc.reord = true
+	}
+}
+
+// dsackSeen updates rack control if duplicate SACK is seen by the connection.
+func (rc *rackControl) dsackSeen() {
+	rc.dsack = true
 }

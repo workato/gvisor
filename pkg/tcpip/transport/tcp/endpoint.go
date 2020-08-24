@@ -2896,6 +2896,8 @@ func (e *endpoint) completeState() stack.TCPEndpointState {
 		EndSequence: rc.endSequence,
 		FACK:        rc.fack,
 		RTT:         rc.rtt,
+		Reord:       rc.reord,
+		DSACK:       rc.dsack,
 	}
 	return s
 }

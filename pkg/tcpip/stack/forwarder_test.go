@@ -16,7 +16,6 @@ package stack
 
 import (
 	"encoding/binary"
-	"math"
 	"testing"
 	"time"
 
@@ -26,9 +25,8 @@ import (
 )
 
 const (
-	fwdTestNetNumber           tcpip.NetworkProtocolNumber = math.MaxUint32
-	fwdTestNetHeaderLen                                    = 12
-	fwdTestNetDefaultPrefixLen                             = 8
+	fwdTestNetHeaderLen        = 12
+	fwdTestNetDefaultPrefixLen = 8
 
 	// fwdTestNetDefaultMTU is the MTU, in bytes, used throughout the tests,
 	// except where another value is explicitly used. It is chosen to match
@@ -94,7 +92,7 @@ func (f *fwdTestNetworkEndpoint) WritePacket(r *Route, gso *GSO, params NetworkH
 	b[srcAddrOffset] = r.LocalAddress[0]
 	b[protocolNumberOffset] = byte(params.Protocol)
 
-	return f.ep.WritePacket(r, gso, fwdTestNetNumber, pkt)
+	return f.ep.WritePacket(r, gso, fakeNetNumber, pkt)
 }
 
 // WritePackets implements LinkEndpoint.WritePackets.
@@ -122,7 +120,7 @@ var _ NetworkProtocol = (*fwdTestNetworkProtocol)(nil)
 var _ LinkAddressResolver = (*fwdTestNetworkProtocol)(nil)
 
 func (f *fwdTestNetworkProtocol) Number() tcpip.NetworkProtocolNumber {
-	return fwdTestNetNumber
+	return fakeNetNumber
 }
 
 func (f *fwdTestNetworkProtocol) MinimumPacketSize() int {
@@ -183,7 +181,7 @@ func (f *fwdTestNetworkProtocol) ResolveStaticAddress(addr tcpip.Address) (tcpip
 }
 
 func (f *fwdTestNetworkProtocol) LinkAddressProtocol() tcpip.NetworkProtocolNumber {
-	return fwdTestNetNumber
+	return fakeNetNumber
 }
 
 // fwdTestPacketInfo holds all the information about an outbound packet.
@@ -316,7 +314,7 @@ func fwdTestNetFactory(t *testing.T, proto *fwdTestNetworkProtocol, useNeighborC
 	}
 
 	// Enable forwarding.
-	s.SetForwarding(true)
+	s.SetForwarding(proto.Number(), true)
 
 	// NIC 1 has the link address "a", and added the network address 1.
 	ep1 = &fwdTestLinkEndpoint{
@@ -327,7 +325,7 @@ func fwdTestNetFactory(t *testing.T, proto *fwdTestNetworkProtocol, useNeighborC
 	if err := s.CreateNIC(1, ep1); err != nil {
 		t.Fatal("CreateNIC #1 failed:", err)
 	}
-	if err := s.AddAddress(1, fwdTestNetNumber, "\x01"); err != nil {
+	if err := s.AddAddress(1, fakeNetNumber, "\x01"); err != nil {
 		t.Fatal("AddAddress #1 failed:", err)
 	}
 
@@ -340,7 +338,7 @@ func fwdTestNetFactory(t *testing.T, proto *fwdTestNetworkProtocol, useNeighborC
 	if err := s.CreateNIC(2, ep2); err != nil {
 		t.Fatal("CreateNIC #2 failed:", err)
 	}
-	if err := s.AddAddress(2, fwdTestNetNumber, "\x02"); err != nil {
+	if err := s.AddAddress(2, fakeNetNumber, "\x02"); err != nil {
 		t.Fatal("AddAddress #2 failed:", err)
 	}
 
@@ -400,7 +398,7 @@ func TestForwardingWithStaticResolver(t *testing.T) {
 			// forwarded to NIC 2.
 			buf := buffer.NewView(30)
 			buf[dstAddrOffset] = 3
-			ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
+			ep1.InjectInbound(fakeNetNumber, NewPacketBuffer(PacketBufferOptions{
 				Data: buf.ToVectorisedView(),
 			}))
 
@@ -469,7 +467,7 @@ func TestForwardingWithFakeResolver(t *testing.T) {
 			// forwarded to NIC 2.
 			buf := buffer.NewView(30)
 			buf[dstAddrOffset] = 3
-			ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
+			ep1.InjectInbound(fakeNetNumber, NewPacketBuffer(PacketBufferOptions{
 				Data: buf.ToVectorisedView(),
 			}))
 
@@ -504,7 +502,7 @@ func TestForwardingWithNoResolver(t *testing.T) {
 	// forwarded to NIC 2.
 	buf := buffer.NewView(30)
 	buf[dstAddrOffset] = 3
-	ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
+	ep1.InjectInbound(fakeNetNumber, NewPacketBuffer(PacketBufferOptions{
 		Data: buf.ToVectorisedView(),
 	}))
 
@@ -567,7 +565,7 @@ func TestForwardingWithFakeResolverPartialTimeout(t *testing.T) {
 			// not be forwarded.
 			buf := buffer.NewView(30)
 			buf[dstAddrOffset] = 4
-			ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
+			ep1.InjectInbound(fakeNetNumber, NewPacketBuffer(PacketBufferOptions{
 				Data: buf.ToVectorisedView(),
 			}))
 
@@ -575,7 +573,7 @@ func TestForwardingWithFakeResolverPartialTimeout(t *testing.T) {
 			// forwarded to NIC 2.
 			buf = buffer.NewView(30)
 			buf[dstAddrOffset] = 3
-			ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
+			ep1.InjectInbound(fakeNetNumber, NewPacketBuffer(PacketBufferOptions{
 				Data: buf.ToVectorisedView(),
 			}))
 
@@ -648,7 +646,7 @@ func TestForwardingWithFakeResolverTwoPackets(t *testing.T) {
 			for i := 0; i < 2; i++ {
 				buf := buffer.NewView(30)
 				buf[dstAddrOffset] = 3
-				ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
+				ep1.InjectInbound(fakeNetNumber, NewPacketBuffer(PacketBufferOptions{
 					Data: buf.ToVectorisedView(),
 				}))
 			}
@@ -726,7 +724,7 @@ func TestForwardingWithFakeResolverManyPackets(t *testing.T) {
 				buf[dstAddrOffset] = 3
 				// Set the packet sequence number.
 				binary.BigEndian.PutUint16(buf[fwdTestNetHeaderLen:], uint16(i))
-				ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
+				ep1.InjectInbound(fakeNetNumber, NewPacketBuffer(PacketBufferOptions{
 					Data: buf.ToVectorisedView(),
 				}))
 			}
@@ -816,7 +814,7 @@ func TestForwardingWithFakeResolverManyResolutions(t *testing.T) {
 				// maxPendingResolutions + 7).
 				buf := buffer.NewView(30)
 				buf[dstAddrOffset] = byte(3 + i)
-				ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
+				ep1.InjectInbound(fakeNetNumber, NewPacketBuffer(PacketBufferOptions{
 					Data: buf.ToVectorisedView(),
 				}))
 			}

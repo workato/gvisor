@@ -396,6 +396,23 @@ func Window(window uint16) TransportChecker {
 	}
 }
 
+// WindowLessThanEq creates a checker that checks that the tcp window
+// is less than or equal to the provided value.
+func WindowLessThanEq(window uint16) TransportChecker {
+	return func(t *testing.T, h header.Transport) {
+		t.Helper()
+
+		tcp, ok := h.(header.TCP)
+		if !ok {
+			return
+		}
+
+		if w := tcp.WindowSize(); w > window {
+			t.Errorf("Bad window, got 0x%x, want < 0x%x", w, window)
+		}
+	}
+}
+
 // TCPFlags creates a checker that checks the tcp flags.
 func TCPFlags(flags uint8) TransportChecker {
 	return func(t *testing.T, h header.Transport) {

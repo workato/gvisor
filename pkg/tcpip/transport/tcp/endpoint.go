@@ -384,11 +384,21 @@ type endpoint struct {
 	// to indicate to users that no more data is coming.
 	//
 	// rcvListMu can be taken after the endpoint mu below.
-	rcvListMu     sync.Mutex  `state:"nosave"`
-	rcvList       segmentList `state:"wait"`
-	rcvClosed     bool
-	rcvBufSize    int
-	rcvBufUsed    int
+	rcvListMu sync.Mutex  `state:"nosave"`
+	rcvList   segmentList `state:"wait"`
+	rcvClosed bool
+	// rcvBufSize is the total size of the receive buffer.
+	rcvBufSize int
+	// rcvBufUsed is the actual number of payload bytes held in the receive buffer
+	// not counting any overheads of the segments itself. NOTE: This will always
+	// be strictly <= rcvMemUsed below.
+	rcvBufUsed int
+	// rcvMemUsed tracks the total amount of memory in use by segments held in
+	// rcvList, endpoint.rcv.pendingRcvdSegments. This is used to compute the
+	// window and the actual available buffer space. This is distinct from
+	// rcvBufUsed above which is the actual number of payload bytes held in the
+	// buffer not including any segment overheads.
+	rcvMemUsed    int
 	rcvAutoParams rcvBufAutoTuneParams
 
 	// mu protects all endpoint fields unless documented otherwise. mu must
@@ -888,7 +898,7 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 		e.probe = p
 	}
 
-	e.segmentQueue.setLimit(MaxUnprocessedSegments)
+	e.segmentQueue.ep = e
 	e.tsOffset = timeStampOffset()
 	e.acceptCond = sync.NewCond(&e.acceptMu)
 
@@ -1272,10 +1282,14 @@ func (e *endpoint) readLocked() (buffer.View, *tcpip.Error) {
 
 	if s.viewToDeliver >= len(views) {
 		e.rcvList.Remove(s)
+		// The payload size is removed below. This just removes the overhead
+		// of the segment itself.
+		e.rcvMemUsed -= segSize
 		s.decRef()
 	}
 
 	e.rcvBufUsed -= len(v)
+	e.rcvMemUsed -= len(v)
 
 	// If the window was small before this read and if the read freed up
 	// enough buffer space, to either fit an aMSS or half a receive buffer
@@ -1480,9 +1494,8 @@ func (e *endpoint) windowCrossedACKThresholdLocked(deltaBefore int) (crossed boo
 	if threshold > e.rcvBufSize/2 {
 		threshold = e.rcvBufSize / 2
 	}
-
 	switch {
-	case oldAvail < threshold && newAvail >= threshold:
+	case oldAvail <= threshold && newAvail > threshold:
 		return true, true
 	case oldAvail >= threshold && newAvail < threshold:
 		return true, false
@@ -1614,9 +1627,6 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 			if v < rs.Min {
 				v = rs.Min
 			}
-			if v > rs.Max {
-				v = rs.Max
-			}
 		}
 
 		mask := uint32(notifyReceiveWindowChanged)
@@ -1639,6 +1649,12 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 			v = math.MaxInt32 / 2
 		}
 
+		v = v * 2
+		// Cap it to the maximum permitted value.
+		if v > rs.Max {
+			v = rs.Max
+		}
+		// Double buffer size to account for segment overhead.
 		availBefore := e.receiveBufferAvailableLocked()
 		e.rcvBufSize = v
 		availAfter := e.receiveBufferAvailableLocked()
@@ -1657,6 +1673,7 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 		e.notifyProtocolGoroutine(mask)
 
 	case tcpip.SendBufferSizeOption:
+
 		// Make sure the send buffer size is within the min and max
 		// allowed.
 		var ss tcpip.TCPSendBufferSizeRangeOption
@@ -1664,11 +1681,20 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 			if v < ss.Min {
 				v = ss.Min
 			}
-			if v > ss.Max {
-				v = ss.Max
-			}
 		}
 
+		// Make sure 2*size doesn't overflow.
+		if v > math.MaxInt32/2 {
+			v = math.MaxInt32 / 2
+		}
+
+		v = v * 2
+		// Cap to maximum permitted value.
+		if v > ss.Max {
+			v = ss.Max
+		}
+
+		// Double the buffer size to account for segment overhead.
 		e.sndBufMu.Lock()
 		e.sndBufSize = v
 		e.sndBufMu.Unlock()
@@ -2664,7 +2690,8 @@ func (e *endpoint) readyToRead(s *segment) {
 	e.rcvListMu.Lock()
 	if s != nil {
 		s.incRef()
-		e.rcvBufUsed += s.data.Size()
+		e.rcvBufUsed += s.payloadSize()
+		e.rcvMemUsed += s.segMemSize()
 		// Increase counter if the receive window falls down below MSS
 		// or half receive buffer size, whichever smaller.
 		if crossed, above := e.windowCrossedACKThresholdLocked(-s.data.Size()); crossed && !above {
@@ -2684,15 +2711,16 @@ func (e *endpoint) readyToRead(s *segment) {
 func (e *endpoint) receiveBufferAvailableLocked() int {
 	// We may use more bytes than the buffer size when the receive buffer
 	// shrinks.
-	if e.rcvBufUsed >= e.rcvBufSize {
+	if e.rcvMemUsed >= e.rcvBufSize {
 		return 0
 	}
 
-	return e.rcvBufSize - e.rcvBufUsed
+	return e.rcvBufSize - e.rcvMemUsed
 }
 
 // receiveBufferAvailable calculates how many bytes are still available in the
-// receive buffer.
+// receive buffer based on the actual memory used by all segments held in
+// receive buffer/pending and segment queue.
 func (e *endpoint) receiveBufferAvailable() int {
 	e.rcvListMu.Lock()
 	available := e.receiveBufferAvailableLocked()
@@ -2700,6 +2728,15 @@ func (e *endpoint) receiveBufferAvailable() int {
 	return available
 }
 
+// receiveBufferUsed returns the amount of in-use receive buffer.
+func (e *endpoint) receiveBufferUsed() int {
+	e.rcvListMu.Lock()
+	used := e.rcvBufUsed
+	e.rcvListMu.Unlock()
+	return used
+}
+
+// receiveBufferSize returns the current size of the receive buffer.
 func (e *endpoint) receiveBufferSize() int {
 	e.rcvListMu.Lock()
 	size := e.rcvBufSize
@@ -2708,6 +2745,18 @@ func (e *endpoint) receiveBufferSize() int {
 	return size
 }
 
+// receiveMemUsed returns the total memory in use by segments held by this
+// endpoint.
+func (e *endpoint) receiveMemUsed() int {
+	e.rcvListMu.Lock()
+	used := e.rcvMemUsed
+	e.rcvListMu.Unlock()
+
+	return used
+}
+
+// maxReceiveBufferSize returns the stack wide maximum receive buffer size for
+// an endpoint.
 func (e *endpoint) maxReceiveBufferSize() int {
 	var rs tcpip.TCPReceiveBufferSizeRangeOption
 	if err := e.stack.TransportProtocolOption(ProtocolNumber, &rs); err != nil {
@@ -2854,11 +2903,9 @@ func (e *endpoint) completeState() stack.TCPEndpointState {
 
 	// Copy receiver state.
 	s.Receiver = stack.TCPReceiverState{
-		RcvNxt:         e.rcv.rcvNxt,
-		RcvAcc:         e.rcv.rcvAcc,
-		RcvWndScale:    e.rcv.rcvWndScale,
-		PendingBufUsed: e.rcv.pendingBufUsed,
-		PendingBufSize: e.rcv.pendingBufSize,
+		RcvNxt:      e.rcv.rcvNxt,
+		RcvAcc:      e.rcv.rcvAcc,
+		RcvWndScale: e.rcv.rcvWndScale,
 	}
 
 	// Copy sender state.

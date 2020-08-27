@@ -47,22 +47,24 @@ type receiver struct {
 
 	closed bool
 
+	// pendingRcvdSegments is bounded by the receive buffer size of the
+	// endpoint.
 	pendingRcvdSegments segmentHeap
-	pendingBufUsed      seqnum.Size
-	pendingBufSize      seqnum.Size
+	// pendingBufUsed tracks the total number of bytes (including segment
+	// overhead) currently queued in pendingRcvdSegments.
+	pendingBufUsed int
 
 	// Time when the last ack was received.
 	lastRcvdAckTime time.Time `state:".(unixTime)"`
 }
 
-func newReceiver(ep *endpoint, irs seqnum.Value, rcvWnd seqnum.Size, rcvWndScale uint8, pendingBufSize seqnum.Size) *receiver {
+func newReceiver(ep *endpoint, irs seqnum.Value, rcvWnd seqnum.Size, rcvWndScale uint8) *receiver {
 	return &receiver{
 		ep:              ep,
 		rcvNxt:          irs + 1,
 		rcvAcc:          irs.Add(rcvWnd + 1),
 		rcvWnd:          rcvWnd,
 		rcvWndScale:     rcvWndScale,
-		pendingBufSize:  pendingBufSize,
 		lastRcvdAckTime: time.Now(),
 	}
 }
@@ -85,9 +87,7 @@ func (r *receiver) acceptable(segSeq seqnum.Value, segLen seqnum.Size) bool {
 // getSendParams returns the parameters needed by the sender when building
 // segments to send.
 func (r *receiver) getSendParams() (rcvNxt seqnum.Value, rcvWnd seqnum.Size) {
-	// Calculate the window size based on the available buffer space.
-	receiveBufferAvailable := r.ep.receiveBufferAvailable()
-	acc := r.rcvNxt.Add(seqnum.Size(receiveBufferAvailable))
+	acc := r.rcvNxt.Add(seqnum.Size(r.ep.receiveBufferAvailable()))
 	if r.rcvAcc.LessThan(acc) {
 		r.rcvAcc = acc
 	}
@@ -386,8 +386,14 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err *tcpip.Error) {
 		if segLen > 0 || s.flagIsSet(header.TCPFlagFin) {
 			// We only store the segment if it's within our buffer
 			// size limit.
-			if r.pendingBufUsed < r.pendingBufSize {
-				r.pendingBufUsed += seqnum.Size(s.segMemSize())
+			// Only use 75% of the receive buffer queue for out-of-order segments. This ensures that we always
+			// leave some space for the inorder segments to arrive allowing pending segments to be processed
+			// and delivered to the user.
+			if r.ep.receiveBufferAvailable() > 0 && r.pendingBufUsed < (r.ep.receiveBufferSize()>>2) {
+				r.ep.rcvListMu.Lock()
+				r.ep.rcvMemUsed += s.segMemSize()
+				r.pendingBufUsed += s.segMemSize()
+				r.ep.rcvListMu.Unlock()
 				s.incRef()
 				heap.Push(&r.pendingRcvdSegments, s)
 				UpdateSACKBlocks(&r.ep.sack, segSeq, segSeq.Add(segLen), r.rcvNxt)
@@ -421,7 +427,10 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err *tcpip.Error) {
 		}
 
 		heap.Pop(&r.pendingRcvdSegments)
-		r.pendingBufUsed -= seqnum.Size(s.segMemSize())
+		r.ep.rcvListMu.Lock()
+		r.ep.rcvMemUsed -= s.segMemSize()
+		r.pendingBufUsed -= s.segMemSize()
+		r.ep.rcvListMu.Unlock()
 		s.decRef()
 	}
 	return false, nil

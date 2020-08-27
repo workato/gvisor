@@ -897,7 +897,7 @@ func (e *endpoint) makeOptions(sackBlocks []header.SACKBlock) []byte {
 // sendRaw sends a TCP segment to the endpoint's peer.
 func (e *endpoint) sendRaw(data buffer.VectorisedView, flags byte, seq, ack seqnum.Value, rcvWnd seqnum.Size) *tcpip.Error {
 	var sackBlocks []header.SACKBlock
-	if e.EndpointState() == StateEstablished && e.rcv.pendingBufSize > 0 && (flags&header.TCPFlagAck != 0) {
+	if e.EndpointState() == StateEstablished && e.rcv.pendingRcvdSegments.Len() > 0 && (flags&header.TCPFlagAck != 0) {
 		sackBlocks = e.sack.Blocks[:e.sack.NumBlocks]
 	}
 	options := e.makeOptions(sackBlocks)
@@ -1002,9 +1002,8 @@ func (e *endpoint) transitionToStateEstablishedLocked(h *handshake) {
 	// (indicated by a negative send window scale).
 	e.snd = newSender(e, h.iss, h.ackNum-1, h.sndWnd, h.mss, h.sndWndScale)
 
-	rcvBufSize := seqnum.Size(e.receiveBufferSize())
 	e.rcvListMu.Lock()
-	e.rcv = newReceiver(e, h.ackNum-1, h.rcvWnd, h.effectiveRcvWndScale(), rcvBufSize)
+	e.rcv = newReceiver(e, h.ackNum-1, h.rcvWnd, h.effectiveRcvWndScale())
 	// Bootstrap the auto tuning algorithm. Starting at zero will
 	// result in a really large receive window after the first auto
 	// tuning adjustment.
@@ -1422,10 +1421,6 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 				n := e.fetchNotifications()
 				if n&notifyNonZeroReceiveWindow != 0 {
 					e.rcv.nonZeroWindow()
-				}
-
-				if n&notifyReceiveWindowChanged != 0 {
-					e.rcv.pendingBufSize = seqnum.Size(e.receiveBufferSize())
 				}
 
 				if n&notifyMTUChanged != 0 {

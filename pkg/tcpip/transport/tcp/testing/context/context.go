@@ -745,6 +745,7 @@ func (r *RawEndpoint) VerifyACKWithTS(tsVal uint32) {
 // VerifyACKRcvWnd verifies that the window advertised by the incoming ACK
 // matches the provided rcvWnd.
 func (r *RawEndpoint) VerifyACKRcvWnd(rcvWnd uint16) {
+	r.C.t.Helper()
 	ackPacket := r.C.GetPacket()
 	checker.IPv4(r.C.t, ackPacket,
 		checker.TCP(
@@ -993,6 +994,7 @@ func (c *Context) PassiveConnect(maxPayload, wndScale int, synOptions header.TCP
 // value of the window scaling option to be sent in the SYN. If synOptions.WS >
 // 0 then we send the WindowScale option.
 func (c *Context) PassiveConnectWithOptions(maxPayload, wndScale int, synOptions header.TCPSynOptions) *RawEndpoint {
+	c.t.Helper()
 	opts := make([]byte, header.TCPOptionsMaximumSize)
 	offset := 0
 	offset += header.EncodeMSSOption(uint32(maxPayload), opts)

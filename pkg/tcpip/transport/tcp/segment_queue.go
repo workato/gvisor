@@ -15,6 +15,7 @@
 package tcp
 
 import (
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -22,16 +23,17 @@ import (
 //
 // +stateify savable
 type segmentQueue struct {
-	mu    sync.Mutex  `state:"nosave"`
-	list  segmentList `state:"wait"`
-	limit int
-	used  int
+	mu     sync.Mutex  `state:"nosave"`
+	list   segmentList `state:"wait"`
+	ep     *endpoint
+	frozen bool
+	used   int
 }
 
 // emptyLocked determines if the queue is empty.
 // Preconditions: q.mu must be held.
 func (q *segmentQueue) emptyLocked() bool {
-	return q.used == 0
+	return q.list.Empty()
 }
 
 // empty determines if the queue is empty.
@@ -43,14 +45,6 @@ func (q *segmentQueue) empty() bool {
 	return r
 }
 
-// setLimit updates the limit. No segments are immediately dropped in case the
-// queue becomes full due to the new limit.
-func (q *segmentQueue) setLimit(limit int) {
-	q.mu.Lock()
-	q.limit = limit
-	q.mu.Unlock()
-}
-
 // enqueue adds the given segment to the queue.
 //
 // Returns true when the segment is successfully added to the queue, in which
@@ -58,15 +52,22 @@ func (q *segmentQueue) setLimit(limit int) {
 // false if the queue is full, in which case ownership is retained by the
 // caller.
 func (q *segmentQueue) enqueue(s *segment) bool {
+	// q.ep.receiveBufferAvailable() must be called without holding q.mu to
+	// avoid lock order inversion.
+	used := q.ep.receiveMemUsed()
+	bufSz := q.ep.receiveBufferSize()
 	q.mu.Lock()
-	r := q.used < q.limit
-	if r {
+	// We allow at least 1 extra segment to be queued.
+	allow := q.used+used <= bufSz
+	if allow && !q.frozen {
 		q.list.PushBack(s)
-		q.used++
+		q.used += s.segMemSize()
+	} else {
+		log.Infof("dropping packet: q.used: %d, used: %d, bufSz: %d", q.used, used, bufSz)
 	}
 	q.mu.Unlock()
 
-	return r
+	return allow
 }
 
 // dequeue removes and returns the next segment from queue, if one exists.
@@ -77,9 +78,25 @@ func (q *segmentQueue) dequeue() *segment {
 	s := q.list.Front()
 	if s != nil {
 		q.list.Remove(s)
-		q.used--
+		q.used -= s.segMemSize()
 	}
 	q.mu.Unlock()
 
 	return s
+}
+
+// freeze when called will disallow any more segments from being queued till
+// thaw is called.
+func (q *segmentQueue) freeze() {
+	q.mu.Lock()
+	q.frozen = true
+	q.mu.Unlock()
+}
+
+// thaw unfreezes a previously frozen queue and allows new segments to be queued
+// again.
+func (q *segmentQueue) thaw() {
+	q.mu.Lock()
+	q.frozen = false
+	q.mu.Unlock()
 }

@@ -138,6 +138,11 @@ func (s *segment) logicalLen() seqnum.Size {
 	return l
 }
 
+// payloadSize is the size of s.data.
+func (s *segment) payloadSize() int {
+	return s.data.Size()
+}
+
 // segMemSize is the amount of memory used to hold the segment data and
 // the associated metadata.
 func (s *segment) segMemSize() int {

@@ -15,6 +15,7 @@
 package stack
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -81,26 +82,25 @@ const (
 //
 // +stateify savable
 type IPTables struct {
-	// mu protects tables, priorities, and modified.
+	// mu protects v4Tables, v6Tables, priorities, and modified.
 	mu sync.RWMutex
-
-	// tables maps tableIDs to tables. Holds builtin tables only, not user
-	// tables. mu must be locked for accessing.
-	tables [numTables]Table
-
-	// priorities maps each hook to a list of table names. The order of the
-	// list is the order in which each table should be visited for that
-	// hook. mu needs to be locked for accessing.
-	priorities [NumHooks][]tableID
-
+	// v4Tables and v6tables map tableIDs to tables. They hold builtin
+	// tables only, not user tables. mu must be locked for accessing.
+	v4Tables [numTables]Table
+	v6Tables [numTables]Table
 	// modified is whether tables have been modified at least once. It is
 	// used to elide the iptables performance overhead for workloads that
 	// don't utilize iptables.
 	modified bool
 
+	// priorities maps each hook to a list of table names. The order of the
+	// list is the order in which each table should be visited for that
+	// hook. It is immutable.
+	priorities [NumHooks][]tableID
+
 	connections ConnTrack
 
-	// reaperDone can be signalled to stop the reaper goroutine.
+	// reaperDone can be signaled to stop the reaper goroutine.
 	reaperDone chan struct{}
 }
 
@@ -148,7 +148,7 @@ type Rule struct {
 	Target Target
 }
 
-// IPHeaderFilter holds basic IP filtering data common to every rule.
+// IPHeaderFilter performs basic IP header matching common to every rule.
 //
 // +stateify savable
 type IPHeaderFilter struct {
@@ -196,17 +196,36 @@ type IPHeaderFilter struct {
 	OutputInterfaceInvert bool
 }
 
-// match returns whether hdr matches the filter.
-func (fl IPHeaderFilter) match(hdr header.IPv4, hook Hook, nicName string) bool {
-	// TODO(gvisor.dev/issue/170): Support other fields of the filter.
-	// Check the transport protocol.
-	if fl.Protocol != 0 && fl.Protocol != hdr.TransportProtocol() {
-		return false
-	}
-
+// match implements IPHeaderFilter.match.
+func (fl IPHeaderFilter) match(pkt *PacketBuffer, hook Hook, nicName string) bool {
 	// Check the source and destination IPs.
-	if !filterAddress(hdr.DestinationAddress(), fl.DstMask, fl.Dst, fl.DstInvert) || !filterAddress(hdr.SourceAddress(), fl.SrcMask, fl.Src, fl.SrcInvert) {
-		return false
+	switch pkt.NetworkProtocolNumber {
+	case header.IPv4ProtocolNumber:
+		// TODO(gvisor.dev/issue/170): Support other fields of the filter.
+		// Check the transport protocol.
+		hdr := header.IPv4(pkt.NetworkHeader().View())
+		if fl.CheckProtocol && fl.Protocol != hdr.TransportProtocol() {
+			return false
+		}
+		if !filterAddress(hdr.DestinationAddress(), fl.DstMask, fl.Dst, fl.DstInvert) ||
+			!filterAddress(hdr.SourceAddress(), fl.SrcMask, fl.Src, fl.SrcInvert) {
+			return false
+		}
+
+	case header.IPv6ProtocolNumber:
+		// TODO(gvisor.dev/issue/170): Support other fields of the filter.
+		// Check the transport protocol.
+		hdr := header.IPv6(pkt.NetworkHeader().View())
+		if fl.CheckProtocol && fl.Protocol != hdr.TransportProtocol() {
+			return false
+		}
+		if !filterAddress(hdr.DestinationAddress(), fl.DstMask, fl.Dst, fl.DstInvert) ||
+			!filterAddress(hdr.SourceAddress(), fl.SrcMask, fl.Src, fl.SrcInvert) {
+			return false
+		}
+
+	default:
+		panic(fmt.Sprintf("unknown network protocol with EtherType: %d", pkt.NetworkProtocolNumber))
 	}
 
 	// Check the output interface.

@@ -105,6 +105,7 @@ func BenchmarkSizeNginx(b *testing.B) {
 			machine: machine,
 			port:    port,
 			runOpts: runOpts,
+			cmd:     []string{"sh", "-c", "mkdir -p /tmp/html && cp -a /local/* /tmp/html && nginx"},
 		})
 	defer cleanUpContainers(ctx, servers)
 

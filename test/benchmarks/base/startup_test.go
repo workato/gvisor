@@ -64,6 +64,7 @@ func BenchmarkStartupNginx(b *testing.B) {
 			machine: machine,
 			runOpts: runOpts,
 			port:    80,
+			cmd:     []string{"sh", "-c", "mkdir -p /tmp/html && cp -a /local/* /tmp/html && nginx"},
 		})
 }
 

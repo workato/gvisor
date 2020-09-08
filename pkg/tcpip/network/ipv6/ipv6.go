@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/fragmentation"
+	"gvisor.dev/gvisor/pkg/tcpip/network/hash"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -42,6 +43,9 @@ const (
 	// DefaultTTL is the default hop limit for IPv6 Packets egressed by
 	// Netstack.
 	DefaultTTL = 64
+
+	// buckets is the number of identifier buckets.
+	buckets = 2048
 )
 
 type endpoint struct {
@@ -100,7 +104,48 @@ func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params s
 		SrcAddr:       r.LocalAddress,
 		DstAddr:       r.RemoteAddress,
 	})
-	pkt.NetworkProtocolNumber = header.IPv6ProtocolNumber
+	pkt.NetworkProtocolNumber = ProtocolNumber
+}
+
+func (e *endpoint) packetMustBeFragmented(pkt *stack.PacketBuffer, gso *stack.GSO) bool {
+	return pkt.Size() > int(e.linkEP.MTU()) && (gso == nil || gso.Type == stack.GSONone)
+}
+
+// buildFragments creates all the fragments from a packet and returns them in a
+// list.
+func buildFragments(pf *fragmentation.IPv6PacketFragmenter) stack.PacketBufferList {
+	var pkts stack.PacketBufferList
+	for fragPkt := pf.BuildNextFragment(); fragPkt != nil; fragPkt = pf.BuildNextFragment() {
+		pkts.PushBack(fragPkt)
+	}
+	return pkts
+}
+
+// writePacketFragments will call e.linkEP.WritePacket for each fragment. mtu
+// includes the Network header. The transport header may be set. hashDelta is
+// used to ensure uniqueness of the fragment identification number when we use
+// WritePackets. The transport header protocol number is required to optimize
+// fragmentation and avoid parsing the IPv6 extension headers.
+func (e *endpoint) writePacketFragments(r *stack.Route, gso *stack.GSO, mtu int, hashDelta uint32, pkt *stack.PacketBuffer, transProto tcpip.TransportProtocolNumber) (int, *tcpip.Error) {
+	id := atomic.AddUint32(&e.protocol.ids[hashRoute(r, e.protocol.hashIV)%buckets], hashDelta)
+	pf := fragmentation.NewIPv6PacketFragmenter(pkt, uint32(mtu), transProto, id)
+
+	// TODO(#3884): Evaluate whether we want to send each fragment one by one
+	// using WritePacket() (current strategy) or if we want to create a
+	// PacketBufferList from the fragments and feed it to WritePackets(). It'll be
+	// faster but cost more memory and allocations.
+	n := 0
+	fragPkt := pf.BuildNextFragment()
+	for fragPkt != nil {
+		if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, fragPkt); err != nil {
+			return n, err
+		}
+		r.Stats().IP.PacketsSent.Increment()
+		fragPkt = pf.BuildNextFragment()
+		n++
+	}
+
+	return n, nil
 }
 
 // WritePacket writes a packet to the given destination address and protocol.
@@ -121,6 +166,11 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 		return nil
 	}
 
+	if e.packetMustBeFragmented(pkt, gso) {
+		_, err := e.writePacketFragments(r, gso, int(e.linkEP.MTU()), 1, pkt, params.Protocol)
+		return err
+	}
+
 	r.Stats().IP.PacketsSent.Increment()
 	return e.linkEP.WritePacket(r, gso, ProtocolNumber, pkt)
 }
@@ -134,8 +184,35 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		return pkts.Len(), nil
 	}
 
+	needsFragmentation := false
 	for pb := pkts.Front(); pb != nil; pb = pb.Next() {
 		e.addIPHeader(r, pb, params)
+		if needsFragmentation == false && e.packetMustBeFragmented(pb, gso) {
+			needsFragmentation = true
+		}
+	}
+
+	if needsFragmentation {
+		// At least one packet needs to be fragmented. To preserve memory, degrade
+		// to using the slow path and send packets one by one (as opposed to using
+		// WritePackets())
+		//
+		// TODO(#3884): Reevaluate whether we want to build all the fragment at once
+		// to allow the use WritePackets() even when fragmentation occurs. It'll be
+		// faster but cost more memory and allocations.
+		n := 0
+		for pb := pkts.Front(); pb != nil; pb = pb.Next() {
+			if e.packetMustBeFragmented(pb, gso) {
+				m, _ := e.writePacketFragments(r, gso, int(e.linkEP.MTU()), uint32(1+n), pb, params.Protocol)
+				n += m
+			} else {
+				r.Stats().IP.PacketsSent.Increment()
+				if e.linkEP.WritePacket(r, gso, ProtocolNumber, pb) != nil {
+					n++
+				}
+			}
+		}
+		return n, nil
 	}
 
 	n, err := e.linkEP.WritePackets(r, gso, pkts, ProtocolNumber)
@@ -427,6 +504,9 @@ func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
 }
 
 type protocol struct {
+	ids    []uint32
+	hashIV uint32
+
 	// defaultTTL is the current default TTL for the protocol. Only the
 	// uint8 portion of it is meaningful and it must be accessed
 	// atomically.
@@ -572,7 +652,7 @@ traverseExtensions:
 	}
 	ipHdr = header.IPv6(hdr)
 	pkt.Data.CapLength(int(ipHdr.PayloadLength()))
-	pkt.NetworkProtocolNumber = header.IPv6ProtocolNumber
+	pkt.NetworkProtocolNumber = ProtocolNumber
 
 	return nextHdr, foundNext, true
 }
@@ -587,9 +667,31 @@ func calculateMTU(mtu uint32) uint32 {
 	return maxPayloadSize
 }
 
+// hashRoute calculates a hash value for the given route. It uses the source &
+// destination address and a random initial value (generated once on
+// initialization) to generate the hash.
+func hashRoute(r *stack.Route, hashIV uint32) uint32 {
+	t := r.LocalAddress
+	a := uint32(t[0]) | uint32(t[1])<<8 | uint32(t[2])<<16 | uint32(t[3])<<24
+	t = r.RemoteAddress
+	b := uint32(t[0]) | uint32(t[1])<<8 | uint32(t[2])<<16 | uint32(t[3])<<24
+	return hash.Hash2Words(a, b, hashIV)
+}
+
 // NewProtocol returns an IPv6 network protocol.
 func NewProtocol() stack.NetworkProtocol {
+	ids := make([]uint32, buckets)
+
+	// Randomly initialize hashIV and the ids.
+	r := hash.RandN32(1 + buckets)
+	for i := range ids {
+		ids[i] = r[i]
+	}
+	hashIV := r[buckets]
+
 	return &protocol{
+		ids:           ids,
+		hashIV:        hashIV,
 		defaultTTL:    DefaultTTL,
 		fragmentation: fragmentation.NewFragmentation(header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout),
 	}

@@ -15,6 +15,10 @@
 package ipv6
 
 import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -22,8 +26,10 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/testutil"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -134,6 +140,51 @@ func testReceiveUDP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst 
 	}
 }
 
+func compareFragments(t *testing.T, packets []*stack.PacketBuffer, sourcePacket *stack.PacketBuffer, mtu uint32) {
+	t.Helper()
+
+	// `sourcePacket` does not have IP Headers. Let's take the ones from the
+	// first fragment and use it from here.
+	source := header.IPv6(packets[0].NetworkHeader().View())
+	sourceIPHeadersLen := packets[0].NetworkHeader().View().Size()
+	vv := buffer.NewVectorisedView(sourcePacket.Size(), sourcePacket.Views())
+	source = append(source, vv.ToView()...)
+
+	fmt.Println("source ipHeader + payload size = ", len(source))
+
+	var reassembledPayload buffer.VectorisedView
+	for i, packet := range packets {
+		fmt.Println("Packet number #", i)
+		_ = i
+		// Our source packet has:
+		// * Transport Header (random)
+		// * Data (random)
+		//
+		// in each packet, we're gonna have:
+		// * IPv6 header
+		// * Fragment header
+		// * Transport Header (if packet zero)
+		// * Data
+		//
+		// Let's iterate through each packet, and rebuild the payload.
+		if i == 0 {
+			fmt.Println("Appending transportheader of size ", packet.TransportHeader().View().Size())
+			reassembledPayload.AppendView(packet.TransportHeader().View())
+		}
+		fmt.Println("Appending data of size ", packet.Data.Size())
+		reassembledPayload.Append(packet.Data)
+		if got, want := packet.NetworkProtocolNumber, sourcePacket.NetworkProtocolNumber; got != want {
+			t.Errorf("fragment #%d has wrong network protocol number: got %d, want %d", i, got, want)
+		}
+	}
+
+	result := reassembledPayload.ToView()
+	if !bytes.Equal(result, source[sourceIPHeadersLen:]) {
+		t.Errorf("the reassembled payload is different than the original payload, got: \n%s\nwant:\n%s", hex.Dump(result), hex.Dump(source[sourceIPHeadersLen:]))
+		fmt.Printf("len(result) = %d\nlen(source) = %d\n", len(result), len(source[sourceIPHeadersLen:]))
+	}
+}
+
 // TestReceiveOnAllNodesMulticastAddr tests that IPv6 endpoints receive ICMP and
 // UDP packets destined to the IPv6 link-local all-nodes multicast address.
 func TestReceiveOnAllNodesMulticastAddr(t *testing.T) {
@@ -168,8 +219,6 @@ func TestReceiveOnAllNodesMulticastAddr(t *testing.T) {
 // packets destined to the IPv6 solicited-node address of an assigned IPv6
 // address.
 func TestReceiveOnSolicitedNodeAddr(t *testing.T) {
-	const nicID = 1
-
 	tests := []struct {
 		name            string
 		protocolFactory stack.TransportProtocol
@@ -293,8 +342,6 @@ func TestAddIpv6Address(t *testing.T) {
 }
 
 func TestReceiveIPv6ExtHdrs(t *testing.T) {
-	const nicID = 1
-
 	tests := []struct {
 		name         string
 		extHdr       func(nextHdr uint8) ([]byte, uint8)
@@ -681,7 +728,6 @@ type fragmentData struct {
 
 func TestReceiveIPv6Fragments(t *testing.T) {
 	const (
-		nicID             = 1
 		udpPayload1Length = 256
 		udpPayload2Length = 128
 		// Used to test cases where the fragment blocks are not a multiple of
@@ -1569,6 +1615,111 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 			if gotPayload, _, err := ep.Read(nil); err != tcpip.ErrWouldBlock {
 				t.Fatalf("(last) got Read(nil) = (%x, _, %v), want = (_, _, %s)", gotPayload, err, tcpip.ErrWouldBlock)
 			}
+		})
+	}
+}
+
+type ipv6Context struct {
+	stack.Route
+	LinkEP *testutil.ErrorChannel
+}
+
+func buildContext(t *testing.T, packetCollectorErrors []*tcpip.Error, mtu uint32) ipv6Context {
+	// Make the packet and write it.
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{NewProtocol()},
+	})
+	ep := testutil.NewErrorChannel(100 /* Enough for all tests. */, mtu, "", packetCollectorErrors)
+	s.CreateNIC(1, ep)
+	s.AddAddress(nicID, ProtocolNumber, addr1)
+	{
+		subnet, err := tcpip.NewSubnet(addr2, tcpip.AddressMask(strings.Repeat("\xff", len(addr2))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetRouteTable([]tcpip.Route{{
+			Destination: subnet,
+			NIC:         nicID,
+		}})
+	}
+	r, err := s.FindRoute(nicID, addr1, addr2, ProtocolNumber, false /* multicastLoop */)
+	if err != nil {
+		t.Fatalf("s.FindRoute got %v, want %v", err, nil)
+	}
+	return ipv6Context{
+		Route:  r,
+		LinkEP: ep,
+	}
+}
+
+func TestFragmentation(t *testing.T) {
+	var manyPayloadViewsSizes [1000]int
+	for i := range manyPayloadViewsSizes {
+		manyPayloadViewsSizes[i] = 7
+	}
+	tests := []struct {
+		description       string
+		mtu               uint32
+		gso               *stack.GSO
+		transHdrLen       int
+		extraHdrLen       int
+		payloadViewsSizes []int
+		expectedFrags     int
+	}{
+		{"NoFragmentation", 1280, &stack.GSO{}, 0, header.IPv6MinimumSize, []int{1000}, 1},
+		{"Fragmented", 1280, &stack.GSO{}, 0, header.IPv6MinimumSize, []int{2000}, 2},
+		{"NoFragmentationWithBigHeader", 2000, &stack.GSO{}, 16, header.IPv6MinimumSize, []int{1000}, 1},
+		{"FragmentedWithGsoNil", 800, nil, 0, header.IPv6MinimumSize, []int{1000}, 2},
+		{"FragmentedWithManyViews", 300, &stack.GSO{}, 0, header.IPv6MinimumSize, manyPayloadViewsSizes[:], 29},
+		{"FragmentedWithManyViewsAndPrependableBytes", 300, &stack.GSO{}, 0, header.IPv6MinimumSize + 55, manyPayloadViewsSizes[:], 29},
+		{"FragmentedWithBigHeader", 800, &stack.GSO{}, 20, header.IPv6MinimumSize, []int{1000}, 2},
+		{"FragmentedWithBigHeaderAndPrependableBytes", 800, &stack.GSO{}, 20, header.IPv6MinimumSize + 66, []int{1000}, 2},
+		{"FragmentedWithMTUSmallerThanHeaderAndPrependableBytes", 300, &stack.GSO{}, 1000, header.IPv6MinimumSize, []int{500}, 7},
+	}
+
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			pkt := testutil.MakeRandPkt(test.transHdrLen, test.extraHdrLen, test.payloadViewsSizes, header.IPv6ProtocolNumber)
+			source := pkt.Clone()
+			_ = source
+			c := buildContext(t, nil, test.mtu)
+
+			err := c.Route.WritePacket(test.gso, stack.NetworkHeaderParams{
+				Protocol: tcp.ProtocolNumber,
+				TTL:      42,
+				TOS:      stack.DefaultTOS,
+			}, pkt)
+			if err != nil {
+				t.Errorf("err got %v, want %v", err, nil)
+			}
+
+			var results []*stack.PacketBuffer
+		L:
+			for {
+				select {
+				case pi := <-c.LinkEP.Ch:
+					results = append(results, pi)
+				default:
+					break L
+				}
+			}
+
+			// We will have N packets in results. We now need to perform reassembly
+			// and compare the Source packet with the reassembled packet.
+			// Can we feed this array of packet into the netstack reassembler?
+			fmt.Printf("    hey, sent %+v\n", pkt.NetworkHeader().View())
+			for i, fragment := range results {
+				fmt.Printf("[%d] hey, recv %+v\n", i, fragment.NetworkHeader().View())
+			}
+
+			if got, want := len(results), test.expectedFrags; got != want {
+				t.Errorf("len(results) got %d, want %d", got, want)
+			}
+			if got, want := len(results), int(c.Route.Stats().IP.PacketsSent.Value()); got != want {
+				t.Errorf("no errors yet len(results) got %d, want %d", got, want)
+			}
+
+			compareFragments(t, results, source, test.mtu)
 		})
 	}
 }

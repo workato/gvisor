@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package fragmentation contains the implementation of IP fragmentation.
-// It is based on RFC 791 and RFC 815.
+// It is based on RFC 791 and RFC 815 and RFC 8200.
 package fragmentation
 
 import (
@@ -25,6 +25,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 const (
@@ -210,4 +212,194 @@ func (f *Fragmentation) release(r *reassembler) {
 		log.Printf("memory counter < 0 (%d), this is an accounting bug that requires investigation", f.size)
 		f.size = 0
 	}
+}
+
+type packetFragmenter struct {
+	netHdr            buffer.View
+	transHdr          buffer.View
+	data              buffer.VectorisedView
+	baseReserve       int
+	innerMTU          int
+	fragmentCount     uint32
+	currentFragment   uint32
+	offset            uint16
+	transHdrFitsFirst bool
+}
+
+// newPacketFragmenter prepares the struct needed for packet fragmentation.
+//
+// pkt is the packet to be fragmented.
+//
+// mtu includes the network header(s) currently in the packet.
+//
+// extraHdrLen can be set to reserve extra space for the headers and this will
+// also lower the inner MTU.
+func newPacketFragmenter(pkt *stack.PacketBuffer, mtu uint32, extraHdrLen int) packetFragmenter {
+	// Each fragment will *at least* reserve the bytes available to the Link Layer
+	// (which are currently the only unused header bytes) and the bytes dedicated
+	// to the Network header.
+	baseReserve := pkt.AvailableHeaderBytes() + pkt.NetworkHeader().View().Size() + extraHdrLen
+	innerMTU := int(mtu) - pkt.NetworkHeader().View().Size() - extraHdrLen
+
+	// Round the MTU down to align to 8 bytes.
+	innerMTU &^= 7
+
+	// As per RFC 8200 Section 4.5, some IPv6 extension headers should not be
+	// repeated in each fragment. However we do not currently support any header
+	// of that kind yet, so the following computation is valid for both IPv4 and
+	// IPv6.
+	fragmentablePartLength := pkt.TransportHeader().View().Size() + pkt.Data.Size()
+
+	return packetFragmenter{
+		netHdr:            pkt.NetworkHeader().View(),
+		transHdr:          pkt.TransportHeader().View(),
+		data:              pkt.Data,
+		baseReserve:       baseReserve,
+		innerMTU:          innerMTU,
+		fragmentCount:     uint32((fragmentablePartLength + innerMTU - 1) / innerMTU),
+		transHdrFitsFirst: pkt.TransportHeader().View().Size() <= innerMTU,
+	}
+}
+
+// IPv4PacketFragmenter is the structure that should be used to perform IPv4
+// fragmentation on outbound packets.
+type IPv4PacketFragmenter struct {
+	packetFragmenter
+}
+
+// NewIPv4PacketFragmenter initializes an IPv4PacketFragmenter structure.
+func NewIPv4PacketFragmenter(pkt *stack.PacketBuffer, mtu uint32) IPv4PacketFragmenter {
+	return IPv4PacketFragmenter{newPacketFragmenter(pkt, mtu, 0)}
+}
+
+// IPv6PacketFragmenter is the structure that should be used to perform IPv6
+// fragmentation on outbound packets.
+type IPv6PacketFragmenter struct {
+	packetFragmenter
+
+	// transProto is needed for IPv6 fragmentation when there are extension
+	// headers to avoid parsing them.
+	transProto tcpip.TransportProtocolNumber
+
+	// Fragment identification number.
+	id uint32
+}
+
+// NewIPv6PacketFragmenter initializes an IPv6PacketFragmenter structure.
+func NewIPv6PacketFragmenter(pkt *stack.PacketBuffer, mtu uint32, transProto tcpip.TransportProtocolNumber, id uint32) IPv6PacketFragmenter {
+	return IPv6PacketFragmenter{
+		packetFragmenter: newPacketFragmenter(pkt, mtu, header.IPv6FragmentHeaderSize),
+		transProto:       transProto,
+		id:               id,
+	}
+}
+
+// buildNextFragment initialize a packet with the payload of the next fragment,
+// and returns it along with the number of bytes copied and a boolean indicating
+// if there is more data left or not.
+// Note that the returned packet will not have its network header/link header
+// populated, but the space for them will be reserved.
+func (pf *packetFragmenter) buildNextFragment(proto tcpip.NetworkProtocolNumber) (*stack.PacketBuffer, uint16, bool) {
+	if pf.currentFragment >= pf.fragmentCount {
+		return nil, 0, false
+	}
+
+	reserve := pf.baseReserve
+
+	// Where possible, the first fragment that is sent has the same
+	// number of bytes reserved for header as the input packet. The link-layer
+	// endpoint may depend on this for looking at, eg, L4 headers.
+	if pf.currentFragment == 0 && pf.transHdrFitsFirst {
+		reserve += pf.transHdr.Size()
+	}
+
+	fragPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: reserve,
+	})
+	fragPkt.NetworkProtocolNumber = proto
+
+	// Copy data for the fragment.
+	avail := pf.innerMTU
+
+	if n := len(pf.transHdr); n > 0 {
+		if n > avail {
+			n = avail
+		}
+		if pf.currentFragment == 0 && pf.transHdrFitsFirst {
+			copy(fragPkt.TransportHeader().Push(n), pf.transHdr)
+		} else {
+			fragPkt.Data.AppendView(pf.transHdr[:n:n])
+		}
+		pf.transHdr = pf.transHdr[n:]
+		avail -= n
+	}
+
+	if avail > 0 {
+		n := pf.data.Size()
+		if n > avail {
+			n = avail
+		}
+		pf.data.ReadToVV(&fragPkt.Data, n)
+		avail -= n
+	}
+
+	copied := uint16(pf.innerMTU - avail)
+
+	pf.currentFragment++
+	pf.offset += copied
+
+	return fragPkt, copied, pf.currentFragment != pf.fragmentCount
+}
+
+// BuildNextFragment creates a packet with the headers and data of the next
+// fragment to be sent. Once there are no more fragments to be made, it will
+// return nil.
+func (pf *IPv4PacketFragmenter) BuildNextFragment() *stack.PacketBuffer {
+	fragPkt, copied, more := pf.buildNextFragment(header.IPv4ProtocolNumber)
+
+	if fragPkt != nil {
+		originalIPHdr := header.IPv4(pf.netHdr)
+		nextFragIPHdr := header.IPv4(fragPkt.NetworkHeader().Push(len(originalIPHdr)))
+		copy(nextFragIPHdr, originalIPHdr)
+
+		flags := originalIPHdr.Flags()
+		if more {
+			flags |= header.IPv4FlagMoreFragments
+		}
+		nextFragIPHdr.SetFlagsFragmentOffset(flags, pf.offset-copied)
+		nextFragIPHdr.SetTotalLength(uint16(nextFragIPHdr.HeaderLength()) + copied)
+		nextFragIPHdr.SetChecksum(0)
+		nextFragIPHdr.SetChecksum(^nextFragIPHdr.CalculateChecksum())
+	}
+
+	return fragPkt
+}
+
+// BuildNextFragment creates a packet with the headers and data of the next
+// fragment to be sent. Once there are no more fragments to be made, it will
+// return nil.
+func (pf *IPv6PacketFragmenter) BuildNextFragment() *stack.PacketBuffer {
+	fragPkt, copied, more := pf.buildNextFragment(header.IPv6ProtocolNumber)
+
+	if fragPkt != nil {
+		ipHeadersLen := pf.netHdr.Size() + header.IPv6FragmentHeaderSize
+		originalIPHdr := header.IPv6(pf.netHdr)
+		nextFragIPHdr := header.IPv6(fragPkt.NetworkHeader().Push(ipHeadersLen))
+
+		// Copy the IPv6 header and any extension headers already populated.
+		copy(nextFragIPHdr, originalIPHdr)
+		nextFragIPHdr.SetNextHeader(header.IPv6FragmentHeader)
+		nextFragIPHdr.SetPayloadLength(uint16(copied) + (uint16(ipHeadersLen - header.IPv6MinimumSize)))
+
+		// Populate the newly added Fragment header.
+		fragHdr := header.IPv6Fragment(nextFragIPHdr[pf.netHdr.Size():])
+		fragHdr.Encode(&header.IPv6FragmentFields{
+			M:              more,
+			FragmentOffset: uint16((pf.offset - copied) / 8),
+			Identification: pf.id,
+			NextHeader:     uint8(pf.transProto),
+		})
+	}
+
+	return fragPkt
 }

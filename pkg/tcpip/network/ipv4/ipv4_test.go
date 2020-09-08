@@ -17,8 +17,6 @@ package ipv4_test
 import (
 	"bytes"
 	"encoding/hex"
-	"fmt"
-	"math/rand"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -28,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sniffer"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/testutil"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
@@ -90,31 +89,6 @@ func TestExcludeBroadcast(t *testing.T) {
 			t.Errorf("Connect failed: %v", err)
 		}
 	})
-}
-
-// makeRandPkt generates a randomize packet. hdrLength indicates how much
-// data should already be in the header before WritePacket. extraLength
-// indicates how much extra space should be in the header. The payload is made
-// from many Views of the sizes listed in viewSizes.
-func makeRandPkt(hdrLength int, extraLength int, viewSizes []int) *stack.PacketBuffer {
-	var views []buffer.View
-	totalLength := 0
-	for _, s := range viewSizes {
-		newView := buffer.NewView(s)
-		rand.Read(newView)
-		views = append(views, newView)
-		totalLength += s
-	}
-
-	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		ReserveHeaderBytes: hdrLength + extraLength,
-		Data:               buffer.NewVectorisedView(totalLength, views),
-	})
-	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
-	if _, err := rand.Read(pkt.TransportHeader().Push(hdrLength)); err != nil {
-		panic(fmt.Sprintf("rand.Read: %s", err))
-	}
-	return pkt
 }
 
 // comparePayloads compared the contents of all the packets against the contents
@@ -186,62 +160,17 @@ func compareFragments(t *testing.T, packets []*stack.PacketBuffer, sourcePacketI
 	}
 }
 
-type errorChannel struct {
-	*channel.Endpoint
-	Ch                    chan *stack.PacketBuffer
-	packetCollectorErrors []*tcpip.Error
-}
-
-// newErrorChannel creates a new errorChannel endpoint. Each call to WritePacket
-// will return successive errors from packetCollectorErrors until the list is
-// empty and then return nil each time.
-func newErrorChannel(size int, mtu uint32, linkAddr tcpip.LinkAddress, packetCollectorErrors []*tcpip.Error) *errorChannel {
-	return &errorChannel{
-		Endpoint:              channel.New(size, mtu, linkAddr),
-		Ch:                    make(chan *stack.PacketBuffer, size),
-		packetCollectorErrors: packetCollectorErrors,
-	}
-}
-
-// Drain removes all outbound packets from the channel and counts them.
-func (e *errorChannel) Drain() int {
-	c := 0
-	for {
-		select {
-		case <-e.Ch:
-			c++
-		default:
-			return c
-		}
-	}
-}
-
-// WritePacket stores outbound packets into the channel.
-func (e *errorChannel) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
-	select {
-	case e.Ch <- pkt:
-	default:
-	}
-
-	nextError := (*tcpip.Error)(nil)
-	if len(e.packetCollectorErrors) > 0 {
-		nextError = e.packetCollectorErrors[0]
-		e.packetCollectorErrors = e.packetCollectorErrors[1:]
-	}
-	return nextError
-}
-
-type context struct {
+type ipv4Context struct {
 	stack.Route
-	linkEP *errorChannel
+	linkEP *testutil.ErrorChannel
 }
 
-func buildContext(t *testing.T, packetCollectorErrors []*tcpip.Error, mtu uint32) context {
+func buildContext(t *testing.T, packetCollectorErrors []*tcpip.Error, mtu uint32) ipv4Context {
 	// Make the packet and write it.
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocol{ipv4.NewProtocol()},
 	})
-	ep := newErrorChannel(100 /* Enough for all tests. */, mtu, "", packetCollectorErrors)
+	ep := testutil.NewErrorChannel(100 /* Enough for all tests. */, mtu, "", packetCollectorErrors)
 	s.CreateNIC(1, ep)
 	const (
 		src = "\x10\x00\x00\x01"
@@ -262,7 +191,7 @@ func buildContext(t *testing.T, packetCollectorErrors []*tcpip.Error, mtu uint32
 	if err != nil {
 		t.Fatalf("s.FindRoute got %v, want %v", err, nil)
 	}
-	return context{
+	return ipv4Context{
 		Route:  r,
 		linkEP: ep,
 	}
@@ -274,13 +203,13 @@ func TestFragmentation(t *testing.T) {
 		manyPayloadViewsSizes[i] = 7
 	}
 	fragTests := []struct {
-		description       string
-		mtu               uint32
-		gso               *stack.GSO
-		hdrLength         int
-		extraLength       int
-		payloadViewsSizes []int
-		expectedFrags     int
+		description        string
+		mtu                uint32
+		gso                *stack.GSO
+		transHdrLen        int
+		extraHdrReserveLen int
+		payloadViewsSizes  []int
+		expectedFrags      int
 	}{
 		{"NoFragmentation", 2000, &stack.GSO{}, 0, header.IPv4MinimumSize, []int{1000}, 1},
 		{"NoFragmentationWithBigHeader", 2000, &stack.GSO{}, 16, header.IPv4MinimumSize, []int{1000}, 1},
@@ -295,7 +224,7 @@ func TestFragmentation(t *testing.T) {
 
 	for _, ft := range fragTests {
 		t.Run(ft.description, func(t *testing.T) {
-			pkt := makeRandPkt(ft.hdrLength, ft.extraLength, ft.payloadViewsSizes)
+			pkt := testutil.MakeRandPkt(ft.transHdrLen, ft.extraHdrReserveLen, ft.payloadViewsSizes, header.IPv4ProtocolNumber)
 			source := pkt.Clone()
 			c := buildContext(t, nil, ft.mtu)
 			err := c.Route.WritePacket(ft.gso, stack.NetworkHeaderParams{
@@ -335,7 +264,7 @@ func TestFragmentationErrors(t *testing.T) {
 	fragTests := []struct {
 		description           string
 		mtu                   uint32
-		hdrLength             int
+		transHdrLen           int
 		payloadViewsSizes     []int
 		packetCollectorErrors []*tcpip.Error
 	}{
@@ -347,7 +276,7 @@ func TestFragmentationErrors(t *testing.T) {
 
 	for _, ft := range fragTests {
 		t.Run(ft.description, func(t *testing.T) {
-			pkt := makeRandPkt(ft.hdrLength, header.IPv4MinimumSize, ft.payloadViewsSizes)
+			pkt := testutil.MakeRandPkt(ft.transHdrLen, header.IPv4MinimumSize, ft.payloadViewsSizes, header.IPv4ProtocolNumber)
 			c := buildContext(t, ft.packetCollectorErrors, ft.mtu)
 			err := c.Route.WritePacket(&stack.GSO{}, stack.NetworkHeaderParams{
 				Protocol: tcp.ProtocolNumber,

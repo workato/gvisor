@@ -32,11 +32,13 @@ import (
 	"gvisor.dev/gvisor/pkg/merkletree"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/tools/go_marshal/primitive"
 )
 
 // Name is the default filesystem name.
@@ -589,11 +591,27 @@ func (fd *fileDescription) enableVerity(ctx context.Context, uio usermem.IO, arg
 	return 0, nil
 }
 
+func (fd *fileDescription) getFlags(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+	t := kernel.TaskFromContext(ctx)
+	f := 0
+
+	// All enabled files should store a root hash. This flag is not settable
+	// via FS_IOC_SETFLAGS.
+	if len(fd.d.rootHash) != 0 {
+		f |= linux.FS_VERITY_FL
+	}
+	fP := primitive.Int32(f)
+	_, err := fP.CopyOut(t, args[2].Pointer())
+	return 0, err
+}
+
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
 func (fd *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
 	switch cmd := args[1].Uint(); cmd {
 	case linux.FS_IOC_ENABLE_VERITY:
 		return fd.enableVerity(ctx, uio, args)
+	case linux.FS_IOC_GETFLAGS:
+		return fd.getFlags(ctx, uio, args)
 	default:
 		return fd.lowerFD.Ioctl(ctx, uio, args)
 	}

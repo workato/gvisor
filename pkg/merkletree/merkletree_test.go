@@ -334,14 +334,15 @@ func TestVerify(t *testing.T) {
 				var buf bytes.Buffer
 				data[tc.modifyByte] ^= 1
 				if tc.shouldSucceed {
-					if err := Verify(&buf, bytes.NewReader(data), &tree, tc.dataSize, tc.verifyStart, tc.verifySize, root, dataAndTreeInSameFile); err != nil && err != io.EOF {
+					n, err := Verify(&buf, bytes.NewReader(data), &tree, tc.dataSize, tc.verifyStart, tc.verifySize, root, dataAndTreeInSameFile)
+					if err != nil && err != io.EOF {
 						t.Errorf("Verification failed when expected to succeed: %v", err)
 					}
-					if int64(buf.Len()) != tc.verifySize || !bytes.Equal(data[tc.verifyStart:tc.verifyStart+tc.verifySize], buf.Bytes()) {
+					if n != tc.verifySize || int64(buf.Len()) != tc.verifySize || !bytes.Equal(data[tc.verifyStart:tc.verifyStart+tc.verifySize], buf.Bytes()) {
 						t.Errorf("Incorrect output from Verify")
 					}
 				} else {
-					if err := Verify(&buf, bytes.NewReader(data), &tree, tc.dataSize, tc.verifyStart, tc.verifySize, root, dataAndTreeInSameFile); err == nil {
+					if _, err := Verify(&buf, bytes.NewReader(data), &tree, tc.dataSize, tc.verifyStart, tc.verifySize, root, dataAndTreeInSameFile); err == nil {
 						t.Errorf("Verification succeeded when expected to fail")
 					}
 				}
@@ -382,13 +383,14 @@ func TestVerifyRandom(t *testing.T) {
 		var buf bytes.Buffer
 		// Checks that the random portion of data from the original data is
 		// verified successfully.
-		if err := Verify(&buf, bytes.NewReader(data), &tree, dataSize, start, size, root, dataAndTreeInSameFile); err != nil && err != io.EOF {
+		n, err := Verify(&buf, bytes.NewReader(data), &tree, dataSize, start, size, root, dataAndTreeInSameFile)
+		if err != nil && err != io.EOF {
 			t.Errorf("Verification failed for correct data: %v", err)
 		}
 		if size > dataSize-start {
 			size = dataSize - start
 		}
-		if int64(buf.Len()) != size || !bytes.Equal(data[start:start+size], buf.Bytes()) {
+		if n != size || int64(buf.Len()) != size || !bytes.Equal(data[start:start+size], buf.Bytes()) {
 			t.Errorf("Incorrect output from Verify")
 		}
 
@@ -397,7 +399,7 @@ func TestVerifyRandom(t *testing.T) {
 		randBytePos := rand.Int63n(size)
 		data[start+randBytePos] ^= 1
 
-		if err := Verify(&buf, bytes.NewReader(data), &tree, dataSize, start, size, root, dataAndTreeInSameFile); err == nil {
+		if _, err := Verify(&buf, bytes.NewReader(data), &tree, dataSize, start, size, root, dataAndTreeInSameFile); err == nil {
 			t.Errorf("Verification succeeded for modified data")
 		}
 	}

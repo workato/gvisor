@@ -22,13 +22,13 @@
 package verity
 
 import (
+	"fmt"
 	"strconv"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
-
 	"gvisor.dev/gvisor/pkg/merkletree"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
@@ -597,6 +597,63 @@ func (fd *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.
 	default:
 		return fd.lowerFD.Ioctl(ctx, uio, args)
 	}
+}
+
+// PRead implements vfs.FileDescriptionImpl.PRead.
+func (fd *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
+	// No need to verify if the file is not enabled yet in
+	// allowRuntimeEnable mode.
+	if fd.d.fs.allowRuntimeEnable && len(fd.d.rootHash) == 0 {
+		return fd.lowerFD.PRead(ctx, dst, offset, opts)
+	}
+
+	// dataSize is the size of the whole file.
+	dataSize, err := fd.merkleReader.GetXattr(ctx, &vfs.GetXattrOptions{
+		Name: merkleSizeXattr,
+		Size: sizeOfInt32,
+	})
+
+	// The Merkle tree file for the child should have been created and
+	// contains the expected xattrs. If the file or the xattr does not
+	// exist, it indicates unexpected modifications to the file system.
+	if err == syserror.ENOENT || err == syserror.ENODATA {
+		if noCrashOnVerificationFailure {
+			return 0, err
+		}
+		panic(fmt.Sprintf("Failed to get xattr %s: %v", merkleSizeXattr, err))
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	// The dataSize xattr should be an integer. If it's not, it indicates
+	// unexpected modifications to the file system.
+	size, err := strconv.Atoi(dataSize)
+	if err != nil {
+		if noCrashOnVerificationFailure {
+			return 0, syserror.EINVAL
+		}
+		panic(fmt.Sprintf("Failed to convert xattr %s to int: %v", merkleSizeXattr, err))
+	}
+
+	dataReader := vfs.FileReadWriteSeeker{
+		FD:  fd.lowerFD,
+		Ctx: ctx,
+	}
+
+	merkleReader := vfs.FileReadWriteSeeker{
+		FD:  fd.merkleReader,
+		Ctx: ctx,
+	}
+
+	n, err := merkletree.Verify(dst.Writer(ctx), &dataReader, &merkleReader, int64(size), offset, dst.NumBytes(), fd.d.rootHash, false /* dataAndTreeInSameFile */)
+	if err != nil {
+		if noCrashOnVerificationFailure {
+			return 0, syserror.EINVAL
+		}
+		panic(fmt.Sprintf("Verification failed: %v", err))
+	}
+	return n, err
 }
 
 // LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.

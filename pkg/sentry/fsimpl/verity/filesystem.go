@@ -270,7 +270,7 @@ func (fs *filesystem) verifyChild(ctx context.Context, parent *dentry, child *de
 	// contain the root hash of the children in the parent Merkle tree when
 	// Verify returns with success.
 	var buf bytes.Buffer
-	if err := merkletree.Verify(&buf, &fdReader, &fdReader, int64(parentSize), int64(offset), int64(merkletree.DigestSize()), parent.rootHash, true /* dataAndTreeInSameFile */); err != nil && err != io.EOF {
+	if _, err := merkletree.Verify(&buf, &fdReader, &fdReader, int64(parentSize), int64(offset), int64(merkletree.DigestSize()), parent.rootHash, true /* dataAndTreeInSameFile */); err != nil && err != io.EOF {
 		if noCrashOnVerificationFailure {
 			return nil, syserror.EIO
 		}

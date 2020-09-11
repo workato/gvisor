@@ -15,6 +15,7 @@
 #include "test/syscalls/linux/socket_ipv4_udp_unbound_netlink.h"
 
 #include <arpa/inet.h>
+#include <poll.h>
 
 #include "gtest/gtest.h"
 #include "test/syscalls/linux/socket_netlink_route_util.h"
@@ -33,8 +34,8 @@ TEST_P(IPv4UDPUnboundSocketNetlinkTest, JoinSubnet) {
   // Add an IP address to the loopback interface.
   Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
   struct in_addr addr;
-  EXPECT_EQ(1, inet_pton(AF_INET, "192.0.2.1", &addr));
-  EXPECT_NO_ERRNO(LinkAddLocalAddr(loopback_link.index, AF_INET,
+  ASSERT_EQ(1, inet_pton(AF_INET, "192.0.2.1", &addr));
+  ASSERT_NO_ERRNO(LinkAddLocalAddr(loopback_link.index, AF_INET,
                                    /*prefixlen=*/24, &addr, sizeof(addr)));
 
   auto snd_sock = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
@@ -45,10 +46,10 @@ TEST_P(IPv4UDPUnboundSocketNetlinkTest, JoinSubnet) {
   TestAddress sender_addr("V4NotAssignd1");
   sender_addr.addr.ss_family = AF_INET;
   sender_addr.addr_len = sizeof(sockaddr_in);
-  EXPECT_EQ(1, inet_pton(AF_INET, "192.0.2.2",
+  ASSERT_EQ(1, inet_pton(AF_INET, "192.0.2.2",
                          &(reinterpret_cast<sockaddr_in*>(&sender_addr.addr)
                                ->sin_addr.s_addr)));
-  EXPECT_THAT(
+  ASSERT_THAT(
       bind(snd_sock->get(), reinterpret_cast<sockaddr*>(&sender_addr.addr),
            sender_addr.addr_len),
       SyscallSucceeds());
@@ -58,10 +59,10 @@ TEST_P(IPv4UDPUnboundSocketNetlinkTest, JoinSubnet) {
   TestAddress receiver_addr("V4NotAssigned2");
   receiver_addr.addr.ss_family = AF_INET;
   receiver_addr.addr_len = sizeof(sockaddr_in);
-  EXPECT_EQ(1, inet_pton(AF_INET, "192.0.2.254",
+  ASSERT_EQ(1, inet_pton(AF_INET, "192.0.2.254",
                          &(reinterpret_cast<sockaddr_in*>(&receiver_addr.addr)
                                ->sin_addr.s_addr)));
-  EXPECT_THAT(
+  ASSERT_THAT(
       bind(rcv_sock->get(), reinterpret_cast<sockaddr*>(&receiver_addr.addr),
            receiver_addr.addr_len),
       SyscallSucceeds());
@@ -70,10 +71,10 @@ TEST_P(IPv4UDPUnboundSocketNetlinkTest, JoinSubnet) {
                           reinterpret_cast<sockaddr*>(&receiver_addr.addr),
                           &receiver_addr_len),
               SyscallSucceeds());
-  EXPECT_EQ(receiver_addr_len, receiver_addr.addr_len);
+  ASSERT_EQ(receiver_addr_len, receiver_addr.addr_len);
   char send_buf[kSendBufSize];
   RandomizeBuffer(send_buf, kSendBufSize);
-  EXPECT_THAT(
+  ASSERT_THAT(
       RetryEINTR(sendto)(snd_sock->get(), send_buf, kSendBufSize, 0,
                          reinterpret_cast<sockaddr*>(&receiver_addr.addr),
                          receiver_addr.addr_len),
@@ -84,6 +85,105 @@ TEST_P(IPv4UDPUnboundSocketNetlinkTest, JoinSubnet) {
   ASSERT_THAT(RetryEINTR(recv)(rcv_sock->get(), recv_buf, kSendBufSize, 0),
               SyscallSucceedsWithValue(kSendBufSize));
   EXPECT_EQ(0, memcmp(send_buf, recv_buf, kSendBufSize));
+}
+
+// Tests that broadcast packets are delivered to all interested sockets
+// (wildcard and broadcast address specified sockets).
+//
+// Note, we cannot test the IPv4 Broadcast (255.255.255.255) because we do
+// not have a route to it.
+TEST_P(IPv4UDPUnboundSocketNetlinkTest, ReuseAddrSubnetDirectedBroadcast) {
+  constexpr size_t kNumSocks = 4;
+  constexpr uint16_t kPort = 9876;
+  constexpr int kPollTimeoutMs = 20000;  // Wait up to 20 seconds for the data.
+
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+
+  // Add an IP address to the loopback interface.
+  Link loopback_link = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  struct in_addr add_addr;
+  ASSERT_EQ(1, inet_pton(AF_INET, "192.0.2.1", &add_addr));
+
+  EXPECT_NO_ERRNO(LinkAddLocalAddr(loopback_link.index, AF_INET,
+                                   24 /* prefixlen */, &add_addr,
+                                   sizeof(add_addr)));
+
+  TestAddress broadcast_address("SubnetBroadcastAddress");
+  broadcast_address.addr.ss_family = AF_INET;
+  broadcast_address.addr_len = sizeof(sockaddr_in);
+  auto broadcast_address_in =
+      reinterpret_cast<sockaddr_in*>(&broadcast_address.addr);
+  ASSERT_EQ(1, inet_pton(AF_INET, "192.0.2.255",
+                         &broadcast_address_in->sin_addr.s_addr));
+  broadcast_address_in->sin_port = htons(kPort);
+
+  TestAddress any_address = V4Any();
+  reinterpret_cast<sockaddr_in*>(&any_address.addr)->sin_port = htons(kPort);
+
+  // Out of the 4 endpoint we create, 2 will be bound to a broadcast address
+  // and the rest will be bound to the wildcard address.
+  std::unique_ptr<FileDescriptor> socks[kNumSocks];
+  for (int i = 0; i < kNumSocks; i++) {
+    auto& sock = socks[i];
+
+    sock = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
+
+    ASSERT_THAT(setsockopt(sock->get(), SOL_SOCKET, SO_REUSEADDR, &kSockOptOn,
+                           sizeof(kSockOptOn)),
+                SyscallSucceedsWithValue(0))
+        << "socks[" << i << "]";
+
+    ASSERT_THAT(setsockopt(sock->get(), SOL_SOCKET, SO_BROADCAST, &kSockOptOn,
+                           sizeof(kSockOptOn)),
+                SyscallSucceedsWithValue(0))
+        << "socks[" << i << "]";
+
+    if (i & 1) {
+      ASSERT_THAT(
+          bind(sock->get(), reinterpret_cast<sockaddr*>(&any_address.addr),
+               any_address.addr_len),
+          SyscallSucceeds())
+          << "socks[" << i << "]";
+    } else {
+      ASSERT_THAT(bind(sock->get(),
+                       reinterpret_cast<sockaddr*>(&broadcast_address.addr),
+                       broadcast_address.addr_len),
+                  SyscallSucceeds())
+          << "socks[" << i << "]";
+    }
+  }
+
+  char send_buf[kSendBufSize];
+  RandomizeBuffer(send_buf, kSendBufSize);
+
+  // Broadcasts from each socket should be received by every socket (including
+  // the sending socket).
+  for (int w = 0; w < kNumSocks; w++) {
+    auto& w_sock = socks[w];
+    ASSERT_THAT(
+        RetryEINTR(sendto)(w_sock->get(), send_buf, kSendBufSize, 0,
+                           reinterpret_cast<sockaddr*>(&broadcast_address.addr),
+                           broadcast_address.addr_len),
+        SyscallSucceedsWithValue(kSendBufSize))
+        << "write socks[" << w << "]";
+
+    // Check that we received the packet on all sockets.
+    for (int r = 0; r < kNumSocks; r++) {
+      auto& r_sock = socks[r];
+
+      struct pollfd poll_fd = {r_sock->get(), POLLIN, 0};
+      EXPECT_THAT(RetryEINTR(poll)(&poll_fd, 1, kPollTimeoutMs),
+                  SyscallSucceedsWithValue(1))
+          << "write socks[" << w << "] & read socks[" << r << "]";
+
+      char recv_buf[kSendBufSize] = {};
+      EXPECT_THAT(RetryEINTR(recv)(r_sock->get(), recv_buf, kSendBufSize, 0),
+                  SyscallSucceedsWithValue(kSendBufSize))
+          << "write socks[" << w << "] & read socks[" << r << "]";
+      EXPECT_EQ(0, memcmp(send_buf, recv_buf, kSendBufSize))
+          << "write socks[" << w << "] & read socks[" << r << "]";
+    }
+  }
 }
 
 }  // namespace testing

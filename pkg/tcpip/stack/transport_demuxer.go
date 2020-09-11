@@ -165,7 +165,7 @@ func (epsByNIC *endpointsByNIC) handlePacket(r *Route, id TransportEndpointID, p
 
 	// If this is a broadcast or multicast datagram, deliver the datagram to all
 	// endpoints bound to the right device.
-	if isMulticastOrBroadcast(id.LocalAddress) {
+	if isInboundMulticastOrBroadcast(r) {
 		mpep.handlePacketAll(r, id, pkt)
 		epsByNIC.mu.RUnlock() // Don't use defer for performance reasons.
 		return
@@ -526,7 +526,7 @@ func (d *transportDemuxer) deliverPacket(r *Route, protocol tcpip.TransportProto
 
 	// If the packet is a UDP broadcast or multicast, then find all matching
 	// transport endpoints.
-	if protocol == header.UDPProtocolNumber && isMulticastOrBroadcast(id.LocalAddress) {
+	if protocol == header.UDPProtocolNumber && isInboundMulticastOrBroadcast(r) {
 		eps.mu.RLock()
 		destEPs := eps.findAllEndpointsLocked(id)
 		eps.mu.RUnlock()
@@ -677,10 +677,10 @@ func (d *transportDemuxer) unregisterRawEndpoint(netProto tcpip.NetworkProtocolN
 	eps.mu.Unlock()
 }
 
-func isMulticastOrBroadcast(addr tcpip.Address) bool {
-	return addr == header.IPv4Broadcast || header.IsV4MulticastAddress(addr) || header.IsV6MulticastAddress(addr)
+func isInboundMulticastOrBroadcast(r *Route) bool {
+	return r.IsInboundBroadcast() || header.IsV4MulticastAddress(r.LocalAddress) || header.IsV6MulticastAddress(r.LocalAddress)
 }
 
 func isUnicast(addr tcpip.Address) bool {
-	return addr != header.IPv4Any && addr != header.IPv6Any && !isMulticastOrBroadcast(addr)
+	return addr != header.IPv4Any && addr != header.IPv6Any && addr != header.IPv4Broadcast && !header.IsV4MulticastAddress(addr) && !header.IsV6MulticastAddress(addr)
 }

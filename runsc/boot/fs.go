@@ -110,6 +110,7 @@ func compileMounts(spec *specs.Spec) []specs.Mount {
 	mounts = append(mounts, specs.Mount{
 		Type:        devtmpfs.Name,
 		Destination: "/dev",
+		Options:     []string{"ro", "noexec"},
 	})
 
 	mounts = append(mounts, specs.Mount{
